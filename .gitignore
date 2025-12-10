@@ -1,0 +1,23 @@
+# ===== PYTHON BÁSICO =====
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Ambiente virtual (não subir para o GitHub)
+.venv/
+
+# Arquivos de log
+*.log
+
+# ===== DADOS / PDFs =====
+# Ignora o conteúdo da pasta data, mas permite manter a pasta em si
+data/*
+!data/.gitkeep
+
+# ===== SEGREDOS / CONFIG =====
+.env
+
+# ===== EDITORES / SISTEMA =====
+.vscode/
+.DS_Store
+Thumbs.db
