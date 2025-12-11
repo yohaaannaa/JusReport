@@ -41,7 +41,10 @@ os.makedirs(REL_DIR, exist_ok=True)
 # Config Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
+    print(f"[INFO] GEMINI_API_KEY detectada (prefixo={GEMINI_API_KEY[:6]}...)")
     genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("[AVISO] GEMINI_API_KEY não configurada. IA desativada na API.")
 
 # Modelo padrão (2.5 Pro, com fallback para 1.5 Pro se necessário)
 GEMINI_MODEL_TEXT = os.getenv("GEMINI_MODEL_TEXT", "gemini-2.5-pro")
@@ -58,7 +61,6 @@ if GEMINI_API_KEY:
         print(f"[INFO] Fallback bem-sucedido, usando: {GEMINI_MODEL_TEXT}")
 else:
     text_model = None
-    print("[AVISO] GEMINI_API_KEY não configurada. IA desativada na API.")
 
 
 # ============================================================
@@ -69,7 +71,7 @@ app = FastAPI(title="API Jurídica - JusReport")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # simplificado para ambiente local
+    allow_origins=["*"],      # simplificado para ambiente local / nuvem
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -100,11 +102,18 @@ def health():
     """
     Usado pela interface Streamlit para verificar se a API está viva
     e se o Gemini foi configurado.
+
+    Aqui lemos a variável diretamente do ambiente para debug:
+    isso mostra exatamente o que o container do Render enxerga.
     """
+    env_val = os.getenv("GEMINI_API_KEY")
+
     return {
         "service": "api-juridica",
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "gemini_model": GEMINI_MODEL_TEXT if GEMINI_API_KEY else None,
+        "gemini_env_present": env_val is not None,
+        "gemini_env_prefix": (env_val[:6] + "...") if env_val else None,
+        "gemini_configured": bool(env_val),
+        "gemini_model": GEMINI_MODEL_TEXT if env_val else None,
     }
 
 

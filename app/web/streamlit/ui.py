@@ -123,12 +123,25 @@ def exibir_logo_e_titulo_lado_a_lado() -> None:
 # --------- CHAMADAS À API (FastAPI) ---------
 
 def api_health() -> dict:
+    """
+    Chama /health da API.
+
+    Se conseguir conectar, devolve o JSON da API + api_reachable=True.
+    Se não conseguir, devolve um dict com api_reachable=False e o erro.
+    """
     try:
         r = requests.get(f"{API_BASE}/health", timeout=10)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        data.setdefault("api_reachable", True)
+        return data
     except Exception as e:
-        return {"service": "jusreport-api", "gemini_configured": False, "error": str(e)}
+        return {
+            "service": "jusreport-api",
+            "api_reachable": False,
+            "gemini_configured": False,
+            "error": str(e),
+        }
 
 
 def api_ingest(file_path: str, case_number: str, client_id: Optional[str] = None) -> dict:
@@ -323,9 +336,29 @@ elif pagina == "Área Jusreport":
     st.title("Área Interna - JusReport")
 
     health = api_health()
+
+    # Debug opcional do /health (tanto sucesso quanto erro de conexão)
+    with st.expander("🔎 Debug /health da API", expanded=False):
+        st.json(health)
+
+    api_reachable = health.get("api_reachable", True)
     gemini_ok = bool(health.get("gemini_configured"))
-    if not gemini_ok:
-        st.error("GEMINI_API_KEY não configurada no servidor da API. Configure no .env e reinicie a API.")
+
+    if not api_reachable:
+        st.error(
+            f"Não foi possível conectar na API em {API_BASE}. "
+            f"Verifique a variável JUSREPORT_API_URL no Streamlit Cloud. "
+            f"Detalhe técnico: {health.get('error')}"
+        )
+    elif not gemini_ok:
+        st.error(
+            "GEMINI_API_KEY não configurada na API do Render. "
+            "Defina GEMINI_API_KEY nas variáveis de ambiente do serviço da API e faça redeploy."
+        )
+
+    # Se a API não está acessível, não adianta seguir
+    if not api_reachable:
+        st.stop()
 
     # Login persistente
     if "auth_ok" not in st.session_state:
