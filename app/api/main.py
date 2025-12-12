@@ -2,14 +2,16 @@ import os
 import uuid
 import io
 import traceback
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple, List
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
+
 import pdfplumber
 import google.generativeai as genai
+
 from docx import Document
 from docx.shared import Pt, Inches
 from pydantic import BaseModel
@@ -29,7 +31,14 @@ except ImportError:
 
 # BASE_DIR = raiz do projeto (pasta JusReport)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# Carrega .env apenas se existir (local). No Render, o ideal é usar Environment variables.
+env_path = os.path.join(BASE_DIR, ".env")
+if os.path.exists(env_path):
+    load_dotenv(env_path)
+    print(f"[INFO] .env carregado de: {env_path}")
+else:
+    print("[INFO] .env não encontrado (ok em produção). Usando variáveis do ambiente.")
 
 # Pastas de dados
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -40,27 +49,42 @@ os.makedirs(REL_DIR, exist_ok=True)
 
 # Config Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    print(f"[INFO] GEMINI_API_KEY detectada (prefixo={GEMINI_API_KEY[:6]}...)")
-    genai.configure(api_key=GEMINI_API_KEY)
-else:
-    print("[AVISO] GEMINI_API_KEY não configurada. IA desativada na API.")
-
-# Modelo padrão (2.5 Pro, com fallback para 1.5 Pro se necessário)
 GEMINI_MODEL_TEXT = os.getenv("GEMINI_MODEL_TEXT", "gemini-2.5-pro")
 
-if GEMINI_API_KEY:
+text_model = None
+
+def _configure_gemini() -> None:
+    """Configura o Gemini e instancia o modelo com fallback."""
+    global text_model, GEMINI_MODEL_TEXT
+
+    if not GEMINI_API_KEY:
+        print("[AVISO] GEMINI_API_KEY não configurada. IA desativada na API.")
+        text_model = None
+        return
+
+    print(f"[INFO] GEMINI_API_KEY detectada (prefixo={GEMINI_API_KEY[:6]}...)")
+    genai.configure(api_key=GEMINI_API_KEY)
+
+    # tenta modelo principal
     try:
         text_model = genai.GenerativeModel(GEMINI_MODEL_TEXT)
         print(f"[INFO] Carregado modelo Gemini: {GEMINI_MODEL_TEXT}")
+        return
     except Exception as e:
         print(f"[AVISO] Falha ao carregar modelo {GEMINI_MODEL_TEXT}: {e}")
+
+    # fallback
+    try:
         print("[AVISO] Tentando fallback para 'gemini-1.5-pro'...")
         text_model = genai.GenerativeModel("gemini-1.5-pro")
         GEMINI_MODEL_TEXT = "gemini-1.5-pro"
         print(f"[INFO] Fallback bem-sucedido, usando: {GEMINI_MODEL_TEXT}")
-else:
-    text_model = None
+    except Exception as e:
+        print(f"[ERRO] Falha no fallback do Gemini: {e}")
+        text_model = None
+
+
+_configure_gemini()
 
 
 # ============================================================
@@ -77,7 +101,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# "Banco" simplificado em memória para monitorar ingest e summarize assíncrono
+# "Banco" simplificado em memória para monitorar ingest
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -102,25 +126,20 @@ def health():
     """
     Usado pela interface Streamlit para verificar se a API está viva
     e se o Gemini foi configurado.
-
-    Aqui lemos a variável diretamente do ambiente para debug:
-    isso mostra exatamente o que o container do Render enxerga.
     """
     env_val = os.getenv("GEMINI_API_KEY")
-
     return {
         "service": "api-juridica",
         "gemini_env_present": env_val is not None,
         "gemini_env_prefix": (env_val[:6] + "...") if env_val else None,
-        "gemini_configured": bool(env_val),
+        "gemini_configured": bool(env_val) and (text_model is not None),
         "gemini_model": GEMINI_MODEL_TEXT if env_val else None,
     }
 
-
+# opcional: evitar 405 em HEAD /health (alguns health-checkers usam HEAD)
 @app.head("/health")
 def health_head():
-    # evita 405 em HEAD /health (alguns checks usam HEAD)
-    return {}
+    return JSONResponse(content={}, status_code=200)
 
 
 @app.post("/ingest")
@@ -131,7 +150,8 @@ async def ingest(
 ):
     """
     Recebe 1 arquivo (usaremos só o primeiro por enquanto),
-    salva em data/uploads e cria um job marcado como "done" (ingestão simples).
+    salva em data/uploads e cria um job já marcado como "done"
+    (ingestão simplificada).
     """
     if not files:
         raise HTTPException(status_code=400, detail="Nenhum arquivo enviado")
@@ -146,14 +166,13 @@ async def ingest(
         out.write(content)
 
     JOBS[job_id] = {
-        "status": "done",            # ingestão concluída
+        "status": "done",
         "progress": 100,
         "detail": "Ingestão concluída (simples)",
         "file_path": save_path,
         "case_number": case_number,
         "client_id": client_id,
         "meta": {},
-        "result": None,              # aqui entra o resultado do summarize assíncrono
     }
 
     return {"job_id": job_id}
@@ -162,23 +181,79 @@ async def ingest(
 @app.get("/status/{job_id}")
 def status(job_id: str):
     """
-    Usado pela interface para exibir barra de progresso e recuperar o resultado.
+    Usado pela interface para exibir barra de progresso.
+    Aqui o job já fica como 100% concluído.
     """
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
-
     return {
-        "status": job.get("status"),
-        "progress": job.get("progress", 0),
+        "status": job["status"],
+        "progress": job["progress"],
         "detail": job.get("detail", ""),
-        "result": job.get("result"),   # <- quando done, vem aqui
+        "result": None,
     }
 
 
 # ============================================================
 # EXTRAÇÃO DE TEXTO DO PDF (HOTSPOTS + AMOSTRAGEM GLOBAL)
 # ============================================================
+
+def _detect_planilha_pages(text_by_page: list[str]) -> list[int]:
+    keywords = [
+        "planilha",
+        "demonstrativo",
+        "cálculo",
+        "calculo",
+        "sisbajud",
+        "bacenjud",
+        "bloqueio",
+        "penhora online",
+        "penhora on-line",
+    ]
+    planilha_pages: list[int] = []
+    for idx, page_text in enumerate(text_by_page):
+        tl = (page_text or "").lower()
+        if any(k in tl for k in keywords):
+            planilha_pages.append(idx + 1)
+    return planilha_pages
+
+
+def _build_global_sample(full_text: str, max_chars: int) -> str:
+    total_len = len(full_text)
+    if total_len <= max_chars:
+        return full_text
+
+    part = max_chars // 4
+    if part == 0:
+        part = max_chars
+
+    inicio = full_text[:part]
+
+    mid_center = total_len // 2
+    mid_start = max(0, mid_center - part // 2)
+    mid_end = min(total_len, mid_start + part)
+    meio = full_text[mid_start:mid_end]
+
+    pre_final_start = max(0, total_len - (part * 2))
+    pre_final_end = pre_final_start + part
+    if pre_final_end > total_len:
+        pre_final_end = total_len
+        pre_final_start = max(0, pre_final_end - part)
+    pre_final = full_text[pre_final_start:pre_final_end]
+
+    fim = full_text[-part:]
+
+    return (
+        inicio
+        + "\n\n=== TRECHO CENTRAL DO PROCESSO ===\n\n"
+        + meio
+        + "\n\n=== TRECHO PRÉ-FINAL DO PROCESSO ===\n\n"
+        + pre_final
+        + "\n\n=== TRECHO FINAL DO PROCESSO ===\n\n"
+        + fim
+    )
+
 
 def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
     text_by_page: list[str] = []
@@ -192,6 +267,7 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
                 text_by_page.append(t)
     except Exception as e:
         print(f"[ERRO] Falha ao ler PDF {path}: {e}")
+        return "", {"planilha_pages": []}
 
     full_text = "\n\n".join(text_by_page) if text_by_page else ""
     total_len = len(full_text)
@@ -201,20 +277,16 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
 
     env_max = int(os.getenv("MAX_PDF_CHARS", "30000"))
 
-    # Render Free + Gemini: manter isso mais conservador ajuda MUITO a evitar 502
-    HARD_CAP_CHARS = 40000  # <- mais seguro na nuvem (ajuste se quiser)
+    # Em cloud, seja conservadora para evitar resposta vazia/timeout
+    HARD_CAP_CHARS = int(os.getenv("HARD_CAP_CHARS", "80000"))
     max_chars = min(env_max, HARD_CAP_CHARS)
 
     print(
-        f"[INFO] MAX_PDF_CHARS(.env)={env_max} | HARD_CAP_CHARS={HARD_CAP_CHARS} "
+        f"[INFO] MAX_PDF_CHARS={env_max} | HARD_CAP_CHARS={HARD_CAP_CHARS} "
         f"| usando max_chars={max_chars} | total_len={total_len}"
     )
 
     if total_len <= max_chars:
-        print(
-            f"[INFO] Texto do PDF com {total_len} caracteres, "
-            f"abaixo ou igual ao limite efetivo {max_chars}. Usando texto completo."
-        )
         planilha_pages = _detect_planilha_pages(text_by_page)
         return full_text, {"planilha_pages": planilha_pages}
 
@@ -266,25 +338,16 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
     hotspot_text = "".join(hotspot_parts).strip()
 
     if not hotspot_text:
-        print("[INFO] Nenhuma página com palavras-chave relevantes encontrada. Usando apenas amostragem global.")
         global_sample = _build_global_sample(full_text, max_chars)
         return global_sample, {"planilha_pages": []}
 
     max_hotspot = int(max_chars * 0.6)
     if len(hotspot_text) > max_hotspot:
-        print(
-            f"[AVISO] Texto de hotspots com {len(hotspot_text)} caracteres, "
-            f"maior que max_hotspot={max_hotspot}. Truncando hotspots."
-        )
+        print(f"[AVISO] Hotspots muito grandes ({len(hotspot_text)}). Truncando para {max_hotspot}.")
         hotspot_text = hotspot_text[:max_hotspot]
 
     remaining_chars = max_chars - len(hotspot_text)
     if remaining_chars <= 0:
-        print(
-            f"[AVISO] Espaço de caracteres esgotado somente com hotspots "
-            f"(len={len(hotspot_text)} >= max_chars={max_chars}). "
-            "Retornando apenas hotspots."
-        )
         return hotspot_text, {"planilha_pages": planilha_pages}
 
     global_sample = _build_global_sample(full_text, remaining_chars)
@@ -296,80 +359,46 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
     )
 
     print(
-        f"[INFO] Texto final montado com len={len(final_text)} (máx={max_chars}), "
+        f"[INFO] Texto final len={len(final_text)} (máx={max_chars}), "
         f"hotspots_len={len(hotspot_text)}, global_len={len(global_sample)}"
     )
-
     return final_text, {"planilha_pages": planilha_pages}
-
-
-def _detect_planilha_pages(text_by_page: list[str]) -> list[int]:
-    keywords = [
-        "planilha",
-        "demonstrativo",
-        "cálculo",
-        "calculo",
-        "sisbajud",
-        "bacenjud",
-        "bloqueio",
-        "penhora online",
-        "penhora on-line",
-    ]
-
-    planilha_pages: list[int] = []
-    for idx, page_text in enumerate(text_by_page):
-        tl = (page_text or "").lower()
-        if any(k in tl for k in keywords):
-            planilha_pages.append(idx + 1)
-    return planilha_pages
-
-
-def _build_global_sample(full_text: str, max_chars: int) -> str:
-    total_len = len(full_text)
-    if total_len <= max_chars:
-        return full_text
-
-    part = max_chars // 4
-    if part == 0:
-        part = max_chars
-
-    inicio = full_text[:part]
-
-    mid_center = total_len // 2
-    mid_start = max(0, mid_center - part // 2)
-    mid_end = min(total_len, mid_start + part)
-    meio = full_text[mid_start:mid_end]
-
-    pre_final_start = max(0, total_len - (part * 2))
-    pre_final_end = pre_final_start + part
-    if pre_final_end > total_len:
-        pre_final_end = total_len
-        pre_final_start = max(0, pre_final_end - part)
-    pre_final = full_text[pre_final_start:pre_final_end]
-
-    fim = full_text[-part:]
-
-    return (
-        inicio
-        + "\n\n=== TRECHO CENTRAL DO PROCESSO ===\n\n"
-        + meio
-        + "\n\n=== TRECHO PRÉ-FINAL DO PROCESSO ===\n\n"
-        + pre_final
-        + "\n\n=== TRECHO FINAL DO PROCESSO ===\n\n"
-        + fim
-    )
 
 
 # ============================================================
 # "AGENTES" DE EXECUÇÃO: VÁRIAS PERGUNTAS → UM RELATÓRIO
 # ============================================================
 
-def _run_execucao_agents(base_text: str, case_number: str, action_type: str) -> tuple[str, dict]:
+def _safe_generate_content(prompt: str, section_title: str) -> str:
+    """
+    Chama o Gemini e falha explicitamente se vier vazio.
+    Isso impede a UI de receber relatório vazio.
+    """
     if not text_model:
         raise RuntimeError("Modelo Gemini não está configurado (text_model=None).")
 
+    try:
+        resp = text_model.generate_content(prompt)
+    except Exception as e:
+        raise RuntimeError(f"Falha ao chamar Gemini na seção '{section_title}': {e}")
+
+    raw_text = getattr(resp, "text", None)
+
+    if not raw_text or not raw_text.strip():
+        raise RuntimeError(
+            f"Gemini retornou resposta vazia na seção '{section_title}'. "
+            f"Possíveis causas: prompt grande demais, timeout, bloqueio ou instabilidade."
+        )
+
+    return raw_text.strip()
+
+
+def _run_execucao_agents(base_text: str, case_number: str, action_type: str) -> tuple[str, dict]:
     tasks = [
-        {"key": "cabecalho", "title": "Cabeçalho", "instruction": f"""
+        {
+            "key": "cabecalho",
+            "title": "Cabeçalho",
+            "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO DE TÍTULO EXTRAJUDICIAL.
 
 Sua tarefa NÃO é resumir, mas sim **organizar todas as informações relevantes** que encontrar.
@@ -393,236 +422,99 @@ o mais completa possível:
 • Datas relevantes da operação (emissão, vencimentos, eventual renegociação)  
 • Garantias oferecidas na operação (penhor, hipoteca, fiança, aval etc.) com breve descrição.
 
-REGRAS ESPECIAIS PARA ADVOGADOS:
-- Sempre identifique quem cada advogado representa:
-  • Se o nome aparece em petição ou assinatura do BANCO / EXEQUENTE, considere como "Advogado do Exequente".
-  • Se o nome aparece em petição ou assinatura de EXECUTADO (devedor/avalista), considere como "Advogado dos Executados".
-- NUNCA repita o mesmo advogado nas duas listas. Em caso de dúvida, prefira classificá-lo como "Advogado dos Executados".
-- Se houver menção a publicação/intimação exclusiva em nome de determinado advogado, mantenha-o na lista correta (Exequente ou Executados).
-
-Outras regras:
-- Varra todo o texto com atenção; liste TUDO que encontrar, mesmo que pareça repetido.
+REGRAS:
 - Se algum item não aparecer, escreva "Não informado".
-- Sempre que houver número de documento ou folha/página (ex.: fls. 573), mencione entre parênteses.
-- Responda em Markdown começando com o título "## Cabeçalho" e bullets iniciando com "• ".
-"""},
-
-        {"key": "resumo_inicial", "title": "Resumo da Petição Inicial", "instruction": f"""
+- Sempre que houver fls./páginas, mencione entre parênteses.
+- Responda em Markdown começando com "## Cabeçalho" e bullets iniciando com "• ".
+"""
+        },
+        {
+            "key": "resumo_inicial",
+            "title": "Resumo da Petição Inicial",
+            "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO DE TÍTULO EXTRAJUDICIAL.
 
-Sua tarefa aqui é fazer um **resumo rico em detalhes**, não superficial.
+Com base EXCLUSIVAMENTE no texto abaixo, elabore o **RESUMO DA PETIÇÃO INICIAL** com riqueza de detalhes:
+- Partes (exequente x executados; fiadores/avalistas se houver)
+- Origem da dívida (tipo de contrato, número, data, valor, condições)
+- Valores (valor executado + data; encargos se constarem)
+- Garantias (quais e breve descrição)
+- Pedidos (em bullets)
 
-Com base EXCLUSIVAMENTE no texto abaixo, elabore o **RESUMO DA PETIÇÃO INICIAL**, contendo:
-
-1. Partes:
-   - Quem está processando quem? (exequente x executados, com nomes completos).
-   - Se houver fiadores/avalistas, mencionar expressamente.
-
-2. Origem da dívida:
-   - Tipo de contrato (ex.: Cédula de Crédito Bancário, confissão de dívida, cheque etc.).
-   - Número do documento, data de emissão, valor original e principais condições, se constarem.
-   - Se houve renegociação ou confissão posterior, descreva.
-
-3. Valores:
-   - Informe o valor executado na inicial (valor e data da atualização).
-   - Se a petição mencionar juros, multa, comissão de permanência, encargos, descreva brevemente.
-
-4. Garantias:
-   - Quais garantias são invocadas? (penhor, hipoteca, aval, fiança, alienação fiduciária, etc.)
-   - Descrever sucintamente o bem ou obrigação garantida, se constar.
-
-5. Pedidos:
-   - Liste, em bullets, os pedidos formulados na inicial (ex.: citação, penhora, BACENJUD, RENAJUD, custas, honorários).
-
-Regras:
-- Seja detalhado: prefira pecar pelo excesso de informação do que pela falta.
-- Use entre 3 e 8 parágrafos, além de bullets para os pedidos.
-- Não invente fatos; se algo não constar, simplesmente não mencione ou indique "Não informado".
-- Comece com o título "## Resumo da Petição Inicial" em Markdown.
-"""},
-
-        {"key": "penhora", "title": "Tentativas de Penhora Online e Garantias", "instruction": f"""
+Comece com "## Resumo da Petição Inicial".
+"""
+        },
+        {
+            "key": "penhora",
+            "title": "Tentativas de Penhora Online e Garantias",
+            "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO.
 
-Aqui você deve focar especificamente nas **buscas de bens e garantias**.
-
-Com base EXCLUSIVAMENTE no texto abaixo, faça uma seção chamada
-"## Tentativas de Penhora Online e Garantias" contendo:
-
-1. Sistemas de busca de bens:
-   Para cada sistema listado abaixo, indique com o máximo de detalhes:
-   - se há pedido,
-   - se há decisão deferindo/indeferindo,
-   - se houve efetiva realização (cumprimento) e resultado,
-   - datas, valores e menção a folhas/páginas, se houver.
-
-   Sistemas:
-   - RENAJUD
-   - SISBAJUD/BACENJUD
-   - INFOJUD
-   - SERASAJUD
-   - outros (ex.: pesquisas em cartórios, CCS, SIEL, etc.)
-
-2. Garantias e constrições:
-   - penhora de bens móveis (descrição do bem, valor da avaliação se constar, fls.)
-   - penhora de imóveis (nº da matrícula, cartório, descrição básica, fls.)
-   - arrestos, sequestros, indisponibilidades
-   - registro de penhora em matrícula de imóvel
-   - qualquer outra medida cautelar sobre bens.
-
-3. Se NÃO encontrar qualquer menção a determinado sistema,
-   NÃO afirme que não houve no processo inteiro.
-   Em vez disso, escreva algo como:
-   "Não há informação nos trechos analisados sobre utilização de [NOME DO SISTEMA]."
-
-Regras:
-- Liste cada medida em bullets, com datas e valores sempre que aparecerem.
-- Não invente informação nem conclua negativamente sobre o processo todo; limite-se aos trechos analisados.
-"""},
-
-        {"key": "valores_planilhas", "title": "Valores e Planilhas de Débito", "instruction": f"""
+Com base EXCLUSIVAMENTE no texto abaixo, faça "## Tentativas de Penhora Online e Garantias":
+- SISBAJUD/BACENJUD, RENAJUD, INFOJUD, SERASAJUD (pedido/decisão/resultado/datas/valores)
+- constrições (imóveis, móveis, arrestos, registros)
+- se não houver informação nos trechos analisados, diga isso explicitamente (sem concluir sobre o processo inteiro)
+"""
+        },
+        {
+            "key": "valores_planilhas",
+            "title": "Valores e Planilhas de Débito",
+            "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO.
 
-Sua tarefa aqui é **minerar todos os valores e planilhas** que apareçam no texto.
+Monte "## Valores e Planilhas de Débito":
+- valor original da operação
+- valor executado na inicial
+- planilhas/demonstrativos (data referência, valor total, fls.)
+- tabela de evolução (mesmo que só 1 planilha)
+- bloqueios efetivos SISBAJUD (data, valor, desfecho)
 
-Crie uma seção "## Valores e Planilhas de Débito" contendo:
-
-1. Valor original da operação:
-   - Liste TODO valor que pareça ser o valor original do contrato/operação, com data e documento associado.
-
-2. Valor executado na inicial:
-   - Liste o(s) valor(es) indicado(s) como débito executado, com datas de atualização
-     e referência a planilhas (ex.: "conforme planilha de fls. 573").
-
-3. Planilhas de cálculo / demonstrativos:
-   - Para CADA planilha ou demonstrativo localizado no texto, liste:
-     • Data de referência da atualização (se constar)  
-     • Valor total atualizado  
-     • Referência de folha/página (fls.) ou descrição do documento  
-   - Se localizar planilhas em anos diferentes (ex.: 2016, 2019, 2023), deixe claro em ordem cronológica.
-
-4. Evolução dos valores:
-   - Se localizar mais de uma planilha, faça um quadro em Markdown
-     mostrando a evolução temporal, neste formato:
-
-     | Data de Referência | Valor Atualizado | Observação |
-     | :----------------- | :-------------- | :--------- |
-     | dd/mm/aaaa         | R$ X            | Ex.: "planilha inicial" |
-     | dd/mm/aaaa         | R$ Y            | Ex.: "planilha posterior" |
-
-   - Se encontrar apenas **uma** planilha, ainda assim crie a tabela com uma única linha.
-
-5. Bloqueios via SISBAJUD/BACENJUD:
-   - Se houver bloqueios efetivos (não só pedido), liste:
-     • data do bloqueio  
-     • valor bloqueado  
-     • conta/titular, se constar  
-     • desfecho (ex.: convertido em penhora, desbloqueado etc.), se houver.
-
-Regras importantes:
-- Varra o texto com atenção a qualquer "R$" e datas, correlacionando com contexto (inicial, planilha, bloqueio).
-- NÃO invente valores ou datas.
-- Se não encontrar alguma parte (ex.: planilhas posteriores), escreva explicitamente:
-  "Não foram localizadas planilhas posteriores nos trechos analisados."
-"""},
-
-        {"key": "movimentacoes", "title": "Movimentações Processuais Relevantes", "instruction": f"""
+Se não localizar planilhas posteriores, escreva isso.
+"""
+        },
+        {
+            "key": "movimentacoes",
+            "title": "Movimentações Processuais Relevantes",
+            "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO.
 
-Agora você vai montar uma **linha do tempo detalhada**.
+Monte "## Movimentações Processuais Relevantes" em linha do tempo (bullets):
+• dd/mm/aaaa: ato relevante (fls. se houver)
 
-Crie uma seção "## Movimentações Processuais Relevantes" contendo uma linha por ato relevante,
-NO MÍNIMO para:
-
-- distribuição da ação
-- citação
-- apresentação de embargos, exceções, incidentes (falsidade, desconsideração etc.)
-- decisões de mérito ou relevantes (deferimentos, indeferimentos, extinções, suspensões)
-- juntada de planilhas de débito, laudos, perícias
-- decisões sobre prescrição/prescrição intercorrente
-- decisões sobre SISBAJUD/RENAJUD/INFOJUD etc.
-- sentenças e decisões de instâncias superiores
-- principais atos entre 2018 e 2025 (se houver).
-
-Formato:
-
-• dd/mm/aaaa (ou ano aproximado, se for o caso): descrição objetiva do ato, mencionando fls. quando constar.
-
-Regras:
-- PREFIRA listar muitos atos a poucos. Se houver muita movimentação, foque nas relevantes para:
-  valor do crédito, garantias, prosseguimento/suspensão/extinção da execução.
-- Se a data exata não constar, use algo como "2008 (data não informada): ...".
-- Não faça comentários jurídicos aqui; apenas descreva os atos.
-"""},
-
-        {"key": "analise_juridica", "title": "Análise Jurídica", "instruction": f"""
+Liste o máximo possível de atos relevantes.
+"""
+        },
+        {
+            "key": "analise_juridica",
+            "title": "Análise Jurídica",
+            "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO.
 
-Agora você deve organizar uma **visão consolidada**, em bullets, baseada APENAS no que consta no texto.
-
-Crie a seção "## Análise Jurídica" com os seguintes itens (mantendo a ordem exata abaixo),
-sempre preenchendo cada linha com alguma informação ou, se nada constar, escrevendo "Não informado":
-
-• Exequente: (dados completos disponíveis)  
-• Advogados do Exequente: (nomes e OAB, se constarem)  
-• Executados: (dados completos disponíveis)  
-• Advogados dos Executados: (nomes e OAB)  
-• Fiadores, Avalistas ou Terceiros Garantidores: (se houver, descrever função)  
-• Assinatura de Documentos: (quem assinou cada documento relevante: contrato, confissão de dívida, procurações)  
-• Citação e Intimação: (como ocorreu, quem foi citado, quando, se houve problemas)  
-• Validade das Citações: (se há notícia de nulidade, ou se nada constar → "Não informado")  
-• Bens Móveis em Garantia: (descrição dos bens; se não constar → "Não informado")  
-• Penhora/Arresto: (se houve, sobre quais bens, valores envolvidos, datas principais)  
-• Registro da Penhora: (se houve registro em matrícula; se nada constar → "Não informado")  
-• Outras Penhoras: (em outros processos, se o texto mencionar)  
-• Planilha de Cálculo: (resumir, em 1–3 linhas, a última planilha encontrada: data e valor)  
-• Impugnação aos Cálculos: (se houve; se não constar, dizer "Não informado")  
-• Homologação do Valor: (se houve decisão homologando o valor, mencionar data; senão, "Não informado")  
-• Avaliação de Bens: (se houve pedido/realização, mencionar bens, datas e valores; senão, "Não informado")  
-• Leilão: (se houve designação, realização ou cancelamento; senão, "Não informado")  
-• Manifestação de Terceiros: (se houve embargos de terceiro ou outras intervenções)  
-• Exceção de Pré-Executividade: (se houve; se não constar, "Não informado")  
-• Embargos à Execução: (se houve, situação atual; se não constar, "Não informado")  
-• Incidentes Processuais Relevantes: (ex.: incidente de falsidade, fraude, nulidade, desconsideração; descrever em 2–5 linhas)  
-• Bloqueios e buscas de bens: (resumo do que foi efetivamente feito em SISBAJUD, RENAJUD, INFOJUD etc.; se nada constar, "Não informado")  
-• Prescrição / Prescrição intercorrente: (se há decisão reconhecendo, indeferindo ou risco apontado; ou "Não informado")  
-• Paralisação do Processo: (períodos longos sem movimentação relevantes, com anos aproximados; ou "Não informado").
-
-Regras:
-- Seja o mais factual e detalhado possível, sem emitir opiniões jurídicas, recomendações ou juízos de valor.
-- Se não encontrar nada sobre um item, escreva exatamente "Não informado".
-- Não resuma demais: se houver muita informação relevante, distribua em frases curtas dentro do mesmo bullet.
-"""},
+Crie "## Análise Jurídica" com bullets factuais.
+Se não houver dado, escreva exatamente "Não informado".
+"""
+        },
     ]
 
     sections: dict[str, str] = {}
+
     for task in tasks:
-        prompt = f"""
-{task["instruction"]}
+        prompt = f"""{task["instruction"]}
 
 === TEXTO DO PROCESSO (EXTRAÍDO DO PDF) ===
 
-\"\"\"{base_text}\"\"\"
-"""
+\"\"\"{base_text}\"\"\""""
         print(f"[AGENTE] Rodando sub-tarefa: {task['key']} ({task['title']})")
-        resp = text_model.generate_content(prompt)
-        text = (resp.text or "").strip()
+        text = _safe_generate_content(prompt, task["title"])
         sections[task["key"]] = text
 
     md_parts: list[str] = []
     md_parts.append(f"Sumarização da {action_type} ({case_number})\n")
 
-    order = [
-        "cabecalho",
-        "resumo_inicial",
-        "penhora",
-        "valores_planilhas",
-        "movimentacoes",
-        "analise_juridica",
-    ]
+    order = ["cabecalho", "resumo_inicial", "penhora", "valores_planilhas", "movimentacoes", "analise_juridica"]
 
     for key in order:
-        section_text = sections.get(key, "").strip()
+        section_text = (sections.get(key) or "").strip()
         if not section_text:
             title = next(t["title"] for t in tasks if t["key"] == key)
             md_parts.append(f"## {title}\n\nNão informado.")
@@ -630,42 +522,46 @@ Regras:
             md_parts.append(section_text)
 
     final_md = "\n\n".join(md_parts)
+
+    if not final_md or not final_md.strip():
+        raise RuntimeError("Gemini não retornou conteúdo válido para o relatório final.")
+
     return final_md, sections
 
 
 # ============================================================
-# WORKER ASSÍNCRONO DO /summarize (evita 502 no Render)
+# ENDPOINT /summarize
 # ============================================================
 
-def _summarize_worker(job_id: str, case_number: str, action_type: str) -> None:
+@app.post("/summarize")
+async def summarize(req: SummarizeRequest):
     try:
-        job = JOBS.get(job_id)
+        case_number = req.case_number
+        action_type = req.action_type
+
+        # achar job
+        job = None
+        for j in JOBS.values():
+            if j.get("case_number") == case_number:
+                job = j
+                break
+
         if not job:
-            return
-
-        if not GEMINI_API_KEY or not text_model:
-            job["status"] = "error"
-            job["progress"] = 100
-            job["detail"] = "Gemini não configurado na API (Environment)."
-            return
-
-        job["status"] = "running"
-        job["progress"] = 10
-        job["detail"] = "Extraindo texto do PDF..."
+            raise HTTPException(status_code=404, detail="Nenhum job encontrado para esse número de processo")
 
         file_path = job["file_path"]
 
+        if not GEMINI_API_KEY or not text_model:
+            raise HTTPException(status_code=500, detail="Gemini não configurado na API (Render env / .env local)")
+
         base_text, meta = _extract_text_from_pdf(file_path)
-        if not base_text:
-            base_text = "Não foi possível extrair texto do PDF. Verifique o arquivo."
+        if not base_text.strip():
+            raise HTTPException(status_code=400, detail="Não foi possível extrair texto do PDF (texto vazio).")
 
-        # guarda meta no job
-        job_meta = job.get("meta") or {}
-        job_meta.update(meta or {})
-        job["meta"] = job_meta
-
-        job["progress"] = 35
-        job["detail"] = "Gerando relatório com IA (Gemini)..."
+        if meta:
+            job_meta = job.get("meta") or {}
+            job_meta.update(meta)
+            job["meta"] = job_meta
 
         final_md, sections = _run_execucao_agents(
             base_text=base_text,
@@ -673,69 +569,27 @@ def _summarize_worker(job_id: str, case_number: str, action_type: str) -> None:
             action_type=action_type,
         )
 
-        job["progress"] = 95
-        job["detail"] = "Finalizando..."
+        # proteção final (nunca devolve vazio)
+        if not final_md or not final_md.strip():
+            raise HTTPException(status_code=500, detail="Gemini não retornou conteúdo válido para o relatório.")
 
-        job["result"] = {
+        return {
             "summary_markdown": final_md,
             "sections": sections,
             "used_chunks": [],
-            "meta": meta,
+            "result": {"meta": meta},
         }
 
-        job["status"] = "done"
-        job["progress"] = 100
-        job["detail"] = "Sumarização concluída."
-
+    except HTTPException:
+        raise
     except Exception as e:
         tb = traceback.format_exc()
-        print("ERRO NO WORKER /summarize:\n", tb)
-        job = JOBS.get(job_id)
-        if job:
-            job["status"] = "error"
-            job["progress"] = 100
-            job["detail"] = f"{e.__class__.__name__}: {e}"
+        print("ERRO EM /summarize:\n", tb)
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
 
 
 # ============================================================
-# ENDPOINT /summarize - AGORA ASSÍNCRONO (retorna job_id)
-# ============================================================
-
-@app.post("/summarize")
-async def summarize(req: SummarizeRequest, background_tasks: BackgroundTasks):
-    """
-    Agora o /summarize NÃO segura a conexão.
-    Ele inicia um job e devolve rápido {"job_id": "..."}.
-    O resultado final fica disponível em /status/{job_id} -> result.
-    """
-    case_number = req.case_number
-    action_type = req.action_type
-
-    # Encontrar o job correspondente ao número do processo
-    found_job_id = None
-    for jid, j in JOBS.items():
-        if j.get("case_number") == case_number:
-            found_job_id = jid
-            break
-
-    if not found_job_id:
-        raise HTTPException(status_code=404, detail="Nenhum job encontrado para esse número de processo")
-
-    job = JOBS[found_job_id]
-
-    # marca como queued e dispara o worker
-    job["status"] = "queued"
-    job["progress"] = 5
-    job["detail"] = "Fila de sumarização iniciada..."
-    job["result"] = None
-
-    background_tasks.add_task(_summarize_worker, found_job_id, case_number, action_type)
-
-    return {"job_id": found_job_id, "status": "queued"}
-
-
-# ============================================================
-# ENDPOINT /export/docx - GERA DOCX A PARTIR DO MARKDOWN
+# ENDPOINT /export/docx
 # ============================================================
 
 @app.post("/export/docx")
@@ -760,7 +614,7 @@ async def export_docx(
 
     if include_planilha_images and case_number:
         if not PDF2IMAGE_AVAILABLE:
-            print("[AVISO] include_planilha_images=True, mas pdf2image não está disponível. Nenhuma imagem será inserida.")
+            print("[AVISO] include_planilha_images=True, mas pdf2image não está disponível.")
         else:
             job = None
             for j in JOBS.values():
@@ -770,14 +624,13 @@ async def export_docx(
 
             if job:
                 meta = job.get("meta") or {}
-                planilha_pages = meta.get("planilha_pages") or []
-                planilha_pages = sorted(set(planilha_pages))
+                planilha_pages = sorted(set(meta.get("planilha_pages") or []))
 
                 if planilha_pages:
                     file_path = job.get("file_path")
                     if file_path and os.path.exists(file_path):
                         try:
-                            print(f"[INFO] Gerando imagens das páginas {planilha_pages} do PDF para anexar no DOCX...")
+                            print(f"[INFO] Gerando imagens (páginas {planilha_pages}) para anexar no DOCX...")
                             images = convert_from_path(file_path)
 
                             doc.add_page_break()
@@ -794,13 +647,13 @@ async def export_docx(
                                     doc.add_picture(img_bytes, width=Inches(6.0))
                                     doc.add_paragraph("")
                         except Exception as e:
-                            print(f"[AVISO] Falha ao gerar/ inserir imagens de planilha no DOCX: {e}")
+                            print(f"[AVISO] Falha ao gerar/inserir imagens de planilha no DOCX: {e}")
                     else:
-                        print("[AVISO] Caminho do PDF não encontrado ao tentar gerar imagens de planilha.")
+                        print("[AVISO] Caminho do PDF não encontrado ao tentar gerar imagens.")
                 else:
-                    print("[INFO] Nenhuma página marcada como planilha/SISBAJUD em meta['planilha_pages'].")
+                    print("[INFO] Nenhuma página marcada em meta['planilha_pages'].")
             else:
-                print("[AVISO] Nenhum job encontrado em memória para o case_number informado ao exportar DOCX.")
+                print("[AVISO] Nenhum job encontrado para esse case_number no /export/docx.")
 
     buffer = io.BytesIO()
     doc.save(buffer)
