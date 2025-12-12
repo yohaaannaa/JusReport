@@ -1,7 +1,6 @@
 import os
 import uuid
 import io
-import time
 import traceback
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -9,18 +8,17 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
-
 import pdfplumber
 import google.generativeai as genai
+from pydantic import BaseModel
 from docx import Document
 from docx.shared import Pt, Inches
-from pydantic import BaseModel
 
 # pdf2image é opcional – usamos se estiver instalada
 try:
     from pdf2image import convert_from_path
     PDF2IMAGE_AVAILABLE = True
-except ImportError:
+except Exception:
     PDF2IMAGE_AVAILABLE = False
     print("[AVISO] pdf2image não está instalado. Prints de planilhas não serão gerados.")
 
@@ -29,36 +27,57 @@ except ImportError:
 # CONFIGURAÇÃO BÁSICA (PATHS, .ENV, GEMINI, PASTAS)
 # ============================================================
 
+# BASE_DIR = raiz do projeto (pasta JusReport)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-dotenv_path = os.path.join(BASE_DIR, ".env")
-if os.path.exists(dotenv_path):
-    load_dotenv(dotenv_path)
+load_dotenv(os.path.join(BASE_DIR, ".env"))  # local; no Render, env vars já vêm do dashboard
 
+# Pastas de dados
 DATA_DIR = os.path.join(BASE_DIR, "data")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 REL_DIR = os.path.join(DATA_DIR, "relatorios")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(REL_DIR, exist_ok=True)
 
-# Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_TEXT = os.getenv("GEMINI_MODEL_TEXT", "gemini-2.5-pro")
+# Limites
+# Render Free costuma morrer com PDF grande + extração pesada.
+# Padrão: 35MB (ajuste no Render: MAX_UPLOAD_MB=35 ou 50 etc)
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "35"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-text_model = None
+# Limite de caracteres para texto do PDF enviado ao modelo
+ENV_MAX_PDF_CHARS = int(os.getenv("MAX_PDF_CHARS", "120000"))
+HARD_CAP_CHARS = int(os.getenv("HARD_CAP_CHARS", "120000"))  # você quer 120k; deixe igual
+EFFECTIVE_MAX_CHARS = min(ENV_MAX_PDF_CHARS, HARD_CAP_CHARS)
+
+# Config Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL_TEXT = os.getenv("GEMINI_MODEL_TEXT", "gemini-2.5-pro").strip()
+
 if GEMINI_API_KEY:
     print(f"[INFO] GEMINI_API_KEY detectada (prefixo={GEMINI_API_KEY[:6]}...)")
-    genai.configure(api_key=GEMINI_API_KEY)
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"[ERRO] Falha ao configurar Gemini: {e}")
+else:
+    print("[AVISO] GEMINI_API_KEY não configurada. IA desativada na API.")
+
+# Carrega modelo com fallback
+text_model = None
+if GEMINI_API_KEY:
     try:
         text_model = genai.GenerativeModel(GEMINI_MODEL_TEXT)
         print(f"[INFO] Carregado modelo Gemini: {GEMINI_MODEL_TEXT}")
     except Exception as e:
         print(f"[AVISO] Falha ao carregar modelo {GEMINI_MODEL_TEXT}: {e}")
-        print("[AVISO] Tentando fallback para 'gemini-1.5-pro'...")
-        GEMINI_MODEL_TEXT = "gemini-1.5-pro"
-        text_model = genai.GenerativeModel(GEMINI_MODEL_TEXT)
-        print(f"[INFO] Fallback bem-sucedido, usando: {GEMINI_MODEL_TEXT}")
-else:
-    print("[AVISO] GEMINI_API_KEY não configurada. IA desativada na API.")
+        try:
+            print("[AVISO] Tentando fallback para 'gemini-1.5-pro'...")
+            text_model = genai.GenerativeModel("gemini-1.5-pro")
+            GEMINI_MODEL_TEXT = "gemini-1.5-pro"
+            print(f"[INFO] Fallback bem-sucedido, usando: {GEMINI_MODEL_TEXT}")
+        except Exception as e2:
+            print(f"[ERRO] Falha também no fallback: {e2}")
+            text_model = None
 
 
 # ============================================================
@@ -69,13 +88,13 @@ app = FastAPI(title="API Jurídica - JusReport")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ok para MVP (depois restringe)
+    allow_origins=["*"],  # ok para protótipo; em produção, restrinja seu domínio
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Jobs em memória (Render Free reinicia, mas funciona para fluxo simples)
+# "Banco" simplificado em memória (no Render reinicia e perde isso — esperado)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -92,68 +111,95 @@ class SummarizeRequest(BaseModel):
 
 
 # ============================================================
-# HEALTH (GET + HEAD)
+# ENDPOINTS BÁSICOS
 # ============================================================
-
-def _health_payload() -> dict:
-    env_val = os.getenv("GEMINI_API_KEY")
-    return {
-        "service": "api-juridica",
-        "gemini_env_present": env_val is not None,
-        "gemini_env_prefix": (env_val[:6] + "...") if env_val else None,
-        "gemini_configured": bool(env_val),
-        "gemini_model": GEMINI_MODEL_TEXT if env_val else None,
-    }
 
 @app.get("/health")
 def health_get():
-    return _health_payload()
+    env_val = os.getenv("GEMINI_API_KEY")
+    return {
+        "service": "api-juridica",
+        "gemini_env_present": env_val is not None and env_val.strip() != "",
+        "gemini_env_prefix": (env_val[:6] + "...") if env_val else None,
+        "gemini_configured": bool(env_val and env_val.strip()),
+        "gemini_model": GEMINI_MODEL_TEXT if (env_val and env_val.strip()) else None,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "max_pdf_chars": EFFECTIVE_MAX_CHARS,
+    }
 
 @app.head("/health")
 def health_head():
-    # Render costuma dar HEAD /health; sem isso aparecia 405
-    return JSONResponse(content=_health_payload())
+    # Para healthchecks que usam HEAD (Render/monitors)
+    return JSONResponse(content=None, status_code=200)
 
-
-# ============================================================
-# INGEST / STATUS
-# ============================================================
 
 @app.post("/ingest")
 async def ingest(
     files: list[UploadFile] = File(...),
     case_number: str = Form(...),
-    client_id: str | None = Form(None),
+    client_id: Optional[str] = Form(None),
 ):
+    """
+    Recebe arquivo, salva em disco SEM carregar tudo na RAM (streaming),
+    aplica limite de tamanho (MAX_UPLOAD_MB) e cria job em memória.
+    """
     if not files:
         raise HTTPException(status_code=400, detail="Nenhum arquivo enviado")
 
     f = files[0]
     job_id = str(uuid.uuid4())
 
-    safe_name = (f.filename or "arquivo").replace("/", "_").replace("\\", "_")
-    filename = f"{job_id}__{safe_name}"
+    # Normaliza nome para evitar path traversal
+    original_name = os.path.basename(f.filename or "arquivo.pdf")
+    filename = f"{job_id}__{original_name}"
     save_path = os.path.join(UPLOAD_DIR, filename)
 
-    content = await f.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Arquivo vazio")
-
-    with open(save_path, "wb") as out:
-        out.write(content)
+    # Streaming com limite
+    total = 0
+    try:
+        with open(save_path, "wb") as out:
+            while True:
+                chunk = await f.read(1024 * 1024)  # 1MB
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    try:
+                        out.close()
+                    except Exception:
+                        pass
+                    try:
+                        if os.path.exists(save_path):
+                            os.remove(save_path)
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Arquivo muito grande ({total/1024/1024:.1f}MB). Limite atual: {MAX_UPLOAD_MB}MB"
+                    )
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            if os.path.exists(save_path):
+                os.remove(save_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Falha ao salvar upload: {e}")
 
     JOBS[job_id] = {
-        "status": "done",  # ingestão simplificada
+        "status": "done",
         "progress": 100,
-        "detail": "Ingestão concluída",
+        "detail": f"Ingestão concluída ({total/1024/1024:.1f}MB)",
         "file_path": save_path,
         "case_number": case_number,
         "client_id": client_id,
         "meta": {},
     }
 
-    print(f"[INGEST] job={job_id} case={case_number} bytes={len(content)} path={save_path}")
     return {"job_id": job_id}
+
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
@@ -169,34 +215,28 @@ def status(job_id: str):
 
 
 # ============================================================
-# PDF EXTRACTION (base + hotspots) + CONTEXTO POR SEÇÃO
+# EXTRAÇÃO DE TEXTO DO PDF (HOTSPOTS + AMOSTRAGEM GLOBAL)
 # ============================================================
 
-SECTION_KEYWORDS = {
-    "cabecalho": [
-        "classe", "vara", "comarca", "exequente", "executado", "advogado", "oab",
-        "distribuição", "distribuicao", "valor da causa", "cédula", "cedula",
-        "confissão", "confissao", "contrato", "título", "titulo", "ccc", "ccb",
-    ],
-    "penhora": [
-        "renajud", "sisbajud", "bacenjud", "infojud", "serasajud", "bloqueio",
-        "penhora", "arresto", "sequestro", "constrição", "constricao", "ccs",
-    ],
-    "valores_planilhas": [
-        "planilha", "demonstrativo", "cálculo", "calculo", "atualizado",
-        "juros", "multa", "saldo devedor", "r$", "bloqueio", "sisbajud",
-    ],
-    "movimentacoes": [
-        "decisão", "decisao", "sentença", "sentenca", "despacho", "intimação",
-        "intimacao", "citação", "citacao", "juntada", "embargos", "exceção",
-        "excecao", "suspensão", "suspensao", "extinção", "extincao",
-    ],
-    "analise_juridica": [
-        "nulidade", "prescrição", "prescricao", "impugnação", "impugnacao",
-        "homolog", "garantia", "hipoteca", "penhor", "aval", "fiança", "fianca",
-        "terceiro", "embargos", "exceção", "excecao",
-    ],
-}
+def _detect_planilha_pages(text_by_page: List[str]) -> List[int]:
+    keywords = [
+        "planilha",
+        "demonstrativo",
+        "cálculo",
+        "calculo",
+        "sisbajud",
+        "bacenjud",
+        "bloqueio",
+        "penhora online",
+        "penhora on-line",
+    ]
+    pages = []
+    for idx, page_text in enumerate(text_by_page):
+        tl = (page_text or "").lower()
+        if any(k in tl for k in keywords):
+            pages.append(idx + 1)
+    return pages
+
 
 def _build_global_sample(full_text: str, max_chars: int) -> str:
     total_len = len(full_text)
@@ -206,6 +246,7 @@ def _build_global_sample(full_text: str, max_chars: int) -> str:
     part = max_chars // 4 or max_chars
 
     inicio = full_text[:part]
+
     mid_center = total_len // 2
     mid_start = max(0, mid_center - part // 2)
     mid_end = min(total_len, mid_start + part)
@@ -227,153 +268,143 @@ def _build_global_sample(full_text: str, max_chars: int) -> str:
         + fim
     )
 
-def _extract_text_by_page(path: str) -> Tuple[List[str], List[Any]]:
+
+def _extract_text_from_pdf(path: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Extração mais "leve" para Render:
+    - 1ª passada: só extrai texto por página (lista de strings)
+    - identifica hotspots
+    - 2ª passada: só nas páginas hotspot tenta extrair tabelas (sem manter pages_obj em memória)
+    """
     text_by_page: List[str] = []
-    pages_obj: List[Any] = []
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            pages_obj.append(page)
-            t = page.extract_text() or ""
-            text_by_page.append(t)
-    return text_by_page, pages_obj
 
-def _detect_pages_by_keywords(text_by_page: List[str], keywords: List[str], max_pages: int = 12) -> List[int]:
-    hits = []
-    for idx, txt in enumerate(text_by_page):
-        tl = (txt or "").lower()
-        if any(k in tl for k in keywords):
-            hits.append(idx + 1)
-            if len(hits) >= max_pages:
-                break
-    return hits
+    try:
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                text_by_page.append(page.extract_text() or "")
+    except Exception as e:
+        print(f"[ERRO] Falha ao ler PDF {path}: {e}")
+        return "", {"planilha_pages": []}
 
-def _make_context_for_section(
-    section_key: str,
-    text_by_page: List[str],
-    full_text: str,
-    max_chars_section: int,
-) -> Tuple[str, Dict[str, Any]]:
-    """
-    Monta contexto por seção:
-    - pega páginas relevantes por keywords (até 12)
-    - + uma amostragem global curta como “cola”
-    """
-    kws = SECTION_KEYWORDS.get(section_key, [])
-    pages = _detect_pages_by_keywords(text_by_page, kws, max_pages=12)
-
-    parts: List[str] = []
-    for p in pages:
-        raw = text_by_page[p - 1] or ""
-        parts.append(f"\n\n=== PÁGINA {p} (relevante p/ {section_key}) ===\n\n{raw}")
-
-    hotspot = "".join(parts).strip()
-
-    # cola global curta (não 120k) — isso é o que mata 502 quando repete
-    glue = _build_global_sample(full_text, max_chars=max(12000, int(max_chars_section * 0.30)))
-
-    ctx = (
-        (hotspot[: int(max_chars_section * 0.70)] if hotspot else "")
-        + "\n\n=== CONTEXTO GLOBAL (AMOSTRA) ===\n\n"
-        + glue
-    ).strip()
-
-    meta = {"section_pages": pages, "section_key": section_key}
-    # hard cap final
-    if len(ctx) > max_chars_section:
-        ctx = ctx[:max_chars_section]
-    return ctx, meta
-
-def _extract_for_all_sections(path: str) -> Tuple[Dict[str, str], Dict[str, Any]]:
-    """
-    Mantém qualidade (MAX_PDF_CHARS=120000), MAS:
-    - não manda tudo para cada agente
-    - cada agente recebe um contexto menor e direcionado
-    """
-    text_by_page, _ = _extract_text_by_page(path)
     full_text = "\n\n".join(text_by_page)
-    if not full_text.strip():
-        return {}, {"error": "PDF sem texto extraível"}
+    total_len = len(full_text)
+    if total_len == 0:
+        return "", {"planilha_pages": []}
 
-    # Seu alvo de qualidade:
-    env_max = int(os.getenv("MAX_PDF_CHARS", "120000"))
+    max_chars = EFFECTIVE_MAX_CHARS
+    print(f"[INFO] usando max_chars={max_chars} | total_len={total_len}")
 
-    # Mantém 120k como “orçamento do processo”, mas por seção usamos menos (evita 502).
-    # Se quiser mais pesado, aumente para 60000 por seção (mas pode voltar 502 no Free).
-    max_section = int(os.getenv("MAX_SECTION_CHARS", "45000"))
+    # Se coube tudo
+    if total_len <= max_chars:
+        planilha_pages = _detect_planilha_pages(text_by_page)
+        return full_text, {"planilha_pages": planilha_pages}
 
-    # Mesmo que env_max seja 120k, full_text pode ser maior; não precisamos cortar aqui,
-    # porque cada seção já tem seu próprio cap.
-    process_meta = {
-        "total_full_len": len(full_text),
-        "env_max_pdf_chars": env_max,
-        "max_section_chars": max_section,
-    }
+    # Hotspots
+    keywords = [
+        "planilha",
+        "demonstrativo",
+        "cálculo",
+        "calculo",
+        "sisbajud",
+        "bacenjud",
+        "bloqueio",
+        "penhora online",
+        "penhora on-line",
+    ]
 
-    contexts: Dict[str, str] = {}
-    sections_meta: Dict[str, Any] = {}
+    hotspot_pages_idx = []
+    for idx, page_text in enumerate(text_by_page):
+        tl = (page_text or "").lower()
+        if any(k in tl for k in keywords):
+            hotspot_pages_idx.append(idx)
 
-    for section_key in ["cabecalho", "resumo_inicial", "penhora", "valores_planilhas", "movimentacoes", "analise_juridica"]:
-        # resumo_inicial usa keywords do cabecalho (mesmo “início”) como base
-        use_key = "cabecalho" if section_key == "resumo_inicial" else section_key
-        ctx, meta = _make_context_for_section(use_key, text_by_page, full_text, max_chars_section=max_section)
-        contexts[section_key] = ctx
-        sections_meta[section_key] = meta
+    planilha_pages = [i + 1 for i in hotspot_pages_idx]
+    hotspot_parts: List[str] = []
 
-    return contexts, {"process_meta": process_meta, "sections_meta": sections_meta}
+    # Texto das páginas hotspot (sem tabelas ainda)
+    for idx in hotspot_pages_idx:
+        page_num = idx + 1
+        bloco = [f"\n\n=== PÁGINA RELEVANTE {page_num} (palavras-chave localizadas) ===\n\n"]
+        bloco.append(text_by_page[idx] or "")
+        hotspot_parts.append("".join(bloco))
+
+    hotspot_text = "".join(hotspot_parts).strip()
+
+    # Tenta extrair tabelas só nas páginas hotspot (2ª passada)
+    if hotspot_pages_idx:
+        try:
+            with pdfplumber.open(path) as pdf:
+                for idx in hotspot_pages_idx[:30]:  # guarda-chuva pra não explodir memória/tempo
+                    page_num = idx + 1
+                    try:
+                        page = pdf.pages[idx]
+                        tables = page.extract_tables() or []
+                    except Exception as te:
+                        print(f"[AVISO] Falha ao extrair tabelas da pág {page_num}: {te}")
+                        tables = []
+
+                    if tables:
+                        hotspot_text += f"\n\n=== CONTEÚDO DA PLANILHA DETECTADA NA PÁGINA {page_num} ===\n\n"
+                        for t_idx, table in enumerate(tables, start=1):
+                            hotspot_text += f"--- Tabela {t_idx} (pág. {page_num}) ---\n"
+                            for row in table:
+                                row = [cell if cell is not None else "" for cell in row]
+                                hotspot_text += " | ".join(row) + "\n"
+                            hotspot_text += "\n"
+        except Exception as e:
+            print(f"[AVISO] Falha na 2ª passada (tabelas): {e}")
+
+    if not hotspot_text:
+        global_sample = _build_global_sample(full_text, max_chars)
+        return global_sample, {"planilha_pages": []}
+
+    # Reserva 60% para hotspots e o resto para amostragem global
+    max_hotspot = int(max_chars * 0.6)
+    if len(hotspot_text) > max_hotspot:
+        hotspot_text = hotspot_text[:max_hotspot]
+
+    remaining = max_chars - len(hotspot_text)
+    if remaining <= 0:
+        return hotspot_text, {"planilha_pages": planilha_pages}
+
+    global_sample = _build_global_sample(full_text, remaining)
+
+    final_text = (
+        hotspot_text
+        + "\n\n=== AMOSTRAGEM GLOBAL DO PROCESSO ===\n\n"
+        + global_sample
+    )
+
+    return final_text, {"planilha_pages": planilha_pages}
 
 
 # ============================================================
-# GEMINI CALL COM RETRY
+# "AGENTES" (multi chamadas ao Gemini)
 # ============================================================
 
-def _gemini_generate(prompt: str, retries: int = 2, backoff: float = 1.5) -> str:
+def _gemini_generate(prompt: str) -> str:
     if not text_model:
         raise RuntimeError("Gemini não configurado (text_model=None).")
 
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            resp = text_model.generate_content(prompt)
-            return (resp.text or "").strip()
-        except Exception as e:
-            last_err = e
-            print(f"[GEMINI] erro attempt={attempt+1}/{retries+1}: {e}")
-            if attempt < retries:
-                time.sleep(backoff ** attempt)
-    raise last_err  # type: ignore
+    try:
+        resp = text_model.generate_content(prompt)
+        txt = (resp.text or "").strip()
+        return txt
+    except Exception as e:
+        # Aqui cai inclusive PermissionDenied / key leaked / etc.
+        raise RuntimeError(f"GeminiError: {e}")
 
 
-# ============================================================
-# AGENTES (PROMPTS)
-# ============================================================
-
-def _build_tasks(case_number: str, action_type: str) -> List[Dict[str, str]]:
-    return [
+def _run_execucao_agents(base_text: str, case_number: str, action_type: str) -> Tuple[str, dict]:
+    tasks = [
         {
             "key": "cabecalho",
             "title": "Cabeçalho",
             "instruction": """
 Você é um assistente jurídico especialista em EXECUÇÃO DE TÍTULO EXTRAJUDICIAL.
-
 Sua tarefa NÃO é resumir, mas sim organizar todas as informações relevantes que encontrar.
-
-Com base EXCLUSIVAMENTE no texto abaixo, extraia o CABEÇALHO do processo, contendo, o mais completo possível:
-• Número dos autos
-• Classe da ação
-• Vara Cível e Comarca (com número da Vara, se houver)
-• Data(s) da distribuição
-• Exequente (nome e CNPJ/CPF, se constar)
-• Executados (nomes e CNPJ/CPF, separadamente)
-• Advogados do Exequente (nome, OAB, UF – todos)
-• Advogados dos Executados (nome, OAB, UF – todos)
-• Valor da causa (com data se houver)
-• Valor executado/atualizado na inicial (com data se houver)
-• Operação/contrato (CCB, confissão etc.), número da operação, valor original, datas, garantias
-
-Regras:
-- Se não aparecer, escreva "Não informado".
-- Cite fls./páginas se constarem.
-- Responda em Markdown com título "## Cabeçalho" e bullets iniciando com "• ".
+Responda em Markdown começando com "## Cabeçalho" e bullets iniciando com "• ".
+Se algum item não aparecer, escreva "Não informado".
 """,
         },
         {
@@ -381,17 +412,8 @@ Regras:
             "title": "Resumo da Petição Inicial",
             "instruction": """
 Você é um assistente jurídico especialista em EXECUÇÃO DE TÍTULO EXTRAJUDICIAL.
-
-Faça um resumo rico em detalhes da PETIÇÃO INICIAL:
-1) Partes (exequente x executados; fiadores/avalistas se houver)
-2) Origem da dívida (tipo de contrato; número; datas; valor original; renegociação se houver)
-3) Valores (valor executado; data; juros/multa/encargos)
-4) Garantias (hipoteca/penhor/aval/fiança etc.)
-5) Pedidos (em bullets)
-
-Regras:
-- Seja detalhado, sem inventar.
-- Comece com "## Resumo da Petição Inicial".
+Faça um resumo rico em detalhes, não superficial.
+Comece com o título "## Resumo da Petição Inicial" em Markdown.
 """,
         },
         {
@@ -399,17 +421,8 @@ Regras:
             "title": "Tentativas de Penhora Online e Garantias",
             "instruction": """
 Você é um assistente jurídico especialista em EXECUÇÃO.
-
-Monte "## Tentativas de Penhora Online e Garantias":
-- RENAJUD / SISBAJUD(BACENJUD) / INFOJUD / SERASAJUD / outros
-Para cada um: pedido? decisão? cumprimento? resultado? datas/valores/fls.
-
-Inclua:
-- Penhora de móveis / imóveis (matrícula, cartório, avaliação)
-- Arresto/sequestro/indisponibilidade
-- Registro de penhora em matrícula
-
-Regra: se não encontrar, diga "Não há informação nos trechos analisados sobre ...".
+Crie a seção "## Tentativas de Penhora Online e Garantias" com bullets e datas/valores quando houver.
+Se não houver informação nos trechos analisados sobre um sistema, diga isso explicitamente.
 """,
         },
         {
@@ -417,15 +430,8 @@ Regra: se não encontrar, diga "Não há informação nos trechos analisados sob
             "title": "Valores e Planilhas de Débito",
             "instruction": """
 Você é um assistente jurídico especialista em EXECUÇÃO.
-
-Monte "## Valores e Planilhas de Débito":
-1) Valor original da operação (com datas/documentos)
-2) Valor executado na inicial (com data e referência de planilha/fls.)
-3) Planilhas/demonstrativos: liste cada uma (data referência, valor atualizado, fls.)
-4) Tabela cronológica da evolução dos valores (mesmo se só 1 linha)
-5) Bloqueios SISBAJUD/BACENJUD (data, valor, desfecho)
-
-Regra: não invente valores/datas. Se não achar, declare.
+Crie a seção "## Valores e Planilhas de Débito" e inclua tabela de evolução se houver mais de uma planilha.
+Se não localizar planilhas posteriores, escreva explicitamente isso.
 """,
         },
         {
@@ -433,12 +439,8 @@ Regra: não invente valores/datas. Se não achar, declare.
             "title": "Movimentações Processuais Relevantes",
             "instruction": """
 Você é um assistente jurídico especialista em EXECUÇÃO.
-
-Monte "## Movimentações Processuais Relevantes" (linha do tempo):
-• dd/mm/aaaa: ato objetivo (com fls. se houver)
-
-Inclua pelo menos: distribuição, citação, embargos/exceções, decisões relevantes,
-juntadas (planilhas/laudos), decisões sobre buscas (SISBAJUD etc.), sentenças/recursos.
+Monte uma linha do tempo detalhada em bullets:
+• dd/mm/aaaa: descrição objetiva do ato (mencione fls. se constar).
 """,
         },
         {
@@ -446,89 +448,34 @@ juntadas (planilhas/laudos), decisões sobre buscas (SISBAJUD etc.), sentenças/
             "title": "Análise Jurídica",
             "instruction": """
 Você é um assistente jurídico especialista em EXECUÇÃO.
-
-Monte "## Análise Jurídica" em bullets, APENAS com fatos do texto.
-Se não houver dado, escreva "Não informado".
-
-Inclua (ordem):
-• Exequente
-• Advogados do Exequente
-• Executados
-• Advogados dos Executados
-• Fiadores/Avalistas/Terceiros
-• Assinaturas de documentos relevantes
-• Citação/Intimação
-• Validade das citações
-• Bens móveis em garantia
-• Penhora/Arresto
-• Registro da penhora
-• Outras penhoras
-• Planilha de cálculo (última encontrada)
-• Impugnação aos cálculos
-• Homologação do valor
-• Avaliação de bens
-• Leilão
-• Manifestação de terceiros
-• Exceção de pré-executividade
-• Embargos à execução
-• Incidentes relevantes
-• Bloqueios/buscas de bens (resumo efetivo)
-• Prescrição/prescrição intercorrente
-• Paralisação do processo
+Crie a seção "## Análise Jurídica" em bullets, factual, sem opinião.
+Se não encontrar um item, escreva exatamente "Não informado".
 """,
         },
     ]
 
-def _run_agents_with_section_contexts(
-    contexts: Dict[str, str],
-    case_number: str,
-    action_type: str,
-) -> Tuple[str, Dict[str, str]]:
-    tasks = _build_tasks(case_number, action_type)
-    sections: Dict[str, str] = {}
+    sections: dict[str, str] = {}
 
     for task in tasks:
-        key = task["key"]
-        base_text = contexts.get(key, "") or contexts.get("cabecalho", "")
-
-        # hard safety: se vier vazio
-        if not base_text.strip():
-            sections[key] = f"## {task['title']}\n\nNão informado."
-            continue
-
         prompt = f"""{task["instruction"]}
 
-=== TEXTO DO PROCESSO (TRECHOS SELECIONADOS) ===
-\"\"\"{base_text}\"\"\""""
+=== PROCESSO ({action_type}) | Nº {case_number} ===
 
-        print(f"[AGENTE] Rodando: {key}")
-        try:
-            text = _gemini_generate(prompt, retries=2, backoff=1.7)
-        except Exception as e:
-            # fallback: tenta reduzir o contexto e repetir 1 vez
-            print(f"[AGENTE] Falhou {key}. Tentando fallback com contexto reduzido. Erro: {e}")
-            small = base_text[:20000]
-            prompt2 = f"""{task["instruction"]}
-
-=== TEXTO DO PROCESSO (CONTEXTO REDUZIDO) ===
-\"\"\"{small}\"\"\""""
-            try:
-                text = _gemini_generate(prompt2, retries=1, backoff=1.5)
-            except Exception as e2:
-                print(f"[AGENTE] Falhou fallback {key}: {e2}")
-                text = f"## {task['title']}\n\nNão informado."
-
-        sections[key] = (text or "").strip()
+\"\"\"{base_text}\"\"\"
+"""
+        print(f"[AGENTE] Rodando: {task['key']} ({task['title']})")
+        sections[task["key"]] = _gemini_generate(prompt)
 
     md_parts: List[str] = [f"Sumarização da {action_type} ({case_number})\n"]
+
     order = ["cabecalho", "resumo_inicial", "penhora", "valores_planilhas", "movimentacoes", "analise_juridica"]
     for key in order:
-        chunk = (sections.get(key) or "").strip()
-        if not chunk:
+        txt = (sections.get(key) or "").strip()
+        if not txt:
             title = next(t["title"] for t in tasks if t["key"] == key)
             md_parts.append(f"## {title}\n\nNão informado.")
         else:
-            md_parts.append(chunk)
+            md_parts.append(txt)
 
     return "\n\n".join(md_parts), sections
 
@@ -543,7 +490,7 @@ async def summarize(req: SummarizeRequest):
         case_number = req.case_number
         action_type = req.action_type
 
-        # encontrar job
+        # Localiza job
         job = None
         for j in JOBS.values():
             if j.get("case_number") == case_number:
@@ -553,28 +500,27 @@ async def summarize(req: SummarizeRequest):
         if not job:
             raise HTTPException(status_code=404, detail="Nenhum job encontrado para esse número de processo")
 
-        if not GEMINI_API_KEY or not text_model:
-            raise HTTPException(status_code=500, detail="Gemini não configurado na API (Render Environment)")
-
-        file_path = job["file_path"]
+        file_path = job.get("file_path")
         if not file_path or not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="Arquivo do job não encontrado no servidor")
 
-        # monta contextos por seção (qualidade alta sem repetir 120k 6x)
-        contexts, meta = _extract_for_all_sections(file_path)
-        if not contexts:
-            raise HTTPException(status_code=500, detail="Não foi possível extrair texto do PDF")
+        if not GEMINI_API_KEY or not text_model:
+            raise HTTPException(status_code=500, detail="Gemini não configurado na API (env vars)")
 
-        # salva meta no job
+        base_text, meta = _extract_text_from_pdf(file_path)
+        if not base_text:
+            raise HTTPException(status_code=400, detail="Não foi possível extrair texto do PDF")
+
+        # Salva meta no job
         job_meta = job.get("meta") or {}
-        job_meta.update(meta)
+        job_meta.update(meta or {})
         job["meta"] = job_meta
 
-        final_md, sections = _run_agents_with_section_contexts(
-            contexts=contexts,
-            case_number=case_number,
-            action_type=action_type,
-        )
+        final_md, sections = _run_execucao_agents(base_text, case_number, action_type)
+
+        # Se o Gemini retornou vazio (evita “A IA não retornou conteúdo”)
+        if not (final_md or "").strip():
+            raise HTTPException(status_code=502, detail="Gemini retornou vazio (sem conteúdo)")
 
         return {
             "summary_markdown": final_md,
@@ -599,7 +545,7 @@ async def summarize(req: SummarizeRequest):
 async def export_docx(
     content: str = Form(...),
     filename: str = Form("relatorio.docx"),
-    case_number: str | None = Form(None),
+    case_number: Optional[str] = Form(None),
     include_planilha_images: bool = Form(False),
 ):
     doc = Document()
@@ -615,7 +561,7 @@ async def export_docx(
         else:
             doc.add_paragraph(line)
 
-    # prints opcionais
+    # anexos de planilha (opcional)
     if include_planilha_images and case_number and PDF2IMAGE_AVAILABLE:
         job = None
         for j in JOBS.values():
@@ -625,14 +571,14 @@ async def export_docx(
 
         if job:
             meta = job.get("meta") or {}
-            # você pode guardar páginas de planilha aqui no futuro
-            planilha_pages = (meta.get("planilha_pages") or [])
-            planilha_pages = sorted(set(planilha_pages))
-
+            planilha_pages = sorted(set(meta.get("planilha_pages") or []))
             file_path = job.get("file_path")
-            if file_path and os.path.exists(file_path) and planilha_pages:
+
+            if planilha_pages and file_path and os.path.exists(file_path):
                 try:
+                    print(f"[INFO] Gerando imagens das páginas {planilha_pages} para anexar no DOCX...")
                     images = convert_from_path(file_path)
+
                     doc.add_page_break()
                     doc.add_heading("Anexos – Planilhas e Bloqueios Relevantes", level=1)
 
@@ -646,7 +592,7 @@ async def export_docx(
                             doc.add_picture(img_bytes, width=Inches(6.0))
                             doc.add_paragraph("")
                 except Exception as e:
-                    print(f"[AVISO] Falha ao inserir imagens: {e}")
+                    print(f"[AVISO] Falha ao anexar imagens no DOCX: {e}")
 
     buffer = io.BytesIO()
     doc.save(buffer)
