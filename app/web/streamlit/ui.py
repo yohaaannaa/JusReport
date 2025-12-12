@@ -46,11 +46,11 @@ from app.utils.db import (  # type: ignore
 )
 
 # ========= CONFIGURAÇÕES =========
-# Carrega o .env da RAIZ do projeto
+# Carrega o .env da RAIZ do projeto (local). Na nuvem (Streamlit Cloud), os Secrets já viram env vars.
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 RELATORIOS_DIR = REL_DIR
-API_BASE = os.getenv("JUSREPORT_API_URL", "http://127.0.0.1:8000")
+API_BASE = os.getenv("JUSREPORT_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
 # ========= AJUSTES INICIAIS =========
 os.makedirs(RELATORIOS_DIR, exist_ok=True)
@@ -60,8 +60,8 @@ EMAIL_REMETENTE = os.getenv("EMAIL_REMETENTE")
 SENHA_APP = os.getenv("SENHA_APP")
 SENHA_ADVOGADO = os.getenv("SENHA_ADVOGADO", "123cas#@!adv")
 
-# ========= FUNÇÕES =========
 
+# ========= FUNÇÕES =========
 def _guess_mime(filename: str) -> str:
     lower = filename.lower()
     if lower.endswith(".pdf"):
@@ -76,7 +76,7 @@ def enviar_email_cliente(destinatario: str, relatorio_path: str, numero_processo
     Envia o .docx ao cliente. Se credenciais não estiverem configuradas, apenas avisa no UI.
     """
     if not EMAIL_REMETENTE or not SENHA_APP:
-        st.warning("⚠️ Credenciais de e-mail não configuradas (.env). Relatório NÃO foi enviado por e-mail.")
+        st.warning("⚠️ Credenciais de e-mail não configuradas. Relatório NÃO foi enviado por e-mail.")
         return
 
     msg = EmailMessage()
@@ -121,19 +121,15 @@ def exibir_logo_e_titulo_lado_a_lado() -> None:
 
 
 # --------- CHAMADAS À API (FastAPI) ---------
-
 def api_health() -> dict:
     """
-    Chama /health da API.
-
-    Se conseguir conectar, devolve o JSON da API + api_reachable=True.
-    Se não conseguir, devolve um dict com api_reachable=False e o erro.
+    Render Free pode demorar no primeiro request (spin-down). Timeout 60s evita falso negativo.
     """
     try:
-        r = requests.get(f"{API_BASE}/health", timeout=10)
+        r = requests.get(f"{API_BASE}/health", timeout=60)
         r.raise_for_status()
         data = r.json()
-        data.setdefault("api_reachable", True)
+        data["api_reachable"] = True
         return data
     except Exception as e:
         return {
@@ -150,6 +146,8 @@ def api_ingest(file_path: str, case_number: str, client_id: Optional[str] = None
       - files: lista de arquivos ("files")
       - case_number: número do processo
       - client_id: email do cliente (opcional)
+
+    Upload pode demorar (PDF grande) → timeout maior.
     """
     url = f"{API_BASE}/ingest"
     with open(file_path, "rb") as f:
@@ -157,14 +155,14 @@ def api_ingest(file_path: str, case_number: str, client_id: Optional[str] = None
         data = {"case_number": case_number}
         if client_id:
             data["client_id"] = client_id
-        resp = requests.post(url, files=files, data=data, timeout=60)
+        resp = requests.post(url, files=files, data=data, timeout=180)
     resp.raise_for_status()
     return resp.json()
 
 
 def api_status(job_id: str) -> dict:
     url = f"{API_BASE}/status/{job_id}"
-    resp = requests.get(url, timeout=10)
+    resp = requests.get(url, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -172,8 +170,7 @@ def api_status(job_id: str) -> dict:
 def api_summarize(question: str, case_number: str, action_type: str, k: int = 100, return_json: bool = True) -> dict:
     """
     Chama /summarize da API.
-    A API internamente ignora 'question' e 'k' por enquanto,
-    porque ela própria dispara os "sub-agentes" com perguntas fixas.
+    Timeout grande porque o backend faz múltiplas chamadas ao Gemini.
     """
     url = f"{API_BASE}/summarize"
     payload = {
@@ -183,7 +180,6 @@ def api_summarize(question: str, case_number: str, action_type: str, k: int = 10
         "return_json": return_json,
         "action_type": action_type,
     }
-    # Timeout maior porque o backend faz múltiplas chamadas ao Gemini.
     resp = requests.post(url, json=payload, timeout=600)
     resp.raise_for_status()
     return resp.json()
@@ -195,13 +191,12 @@ def api_export_docx(content_markdown: str, filename: str) -> bytes:
     """
     url = f"{API_BASE}/export/docx"
     data = {"content": content_markdown, "filename": filename}
-    resp = requests.post(url, data=data, timeout=60)
+    resp = requests.post(url, data=data, timeout=120)
     resp.raise_for_status()
     return resp.content
 
 
 # --------- CAMADAS DE DADOS UTILIZANDO app.utils.db ---------
-
 def carregar_processos_pendentes_df() -> pd.DataFrame:
     rows = listar_processos(status="pendente")
     if not rows:
@@ -282,14 +277,14 @@ def finalizar_processo_e_enviar(processo_id: str, relatorio_path: str, email_cli
 
 
 # ========= APP STREAMLIT =========
-
 st.set_page_config(page_title="JusReport", page_icon="⚖️", layout="wide")
 
 if not EMAIL_REMETENTE or not SENHA_APP:
-    st.sidebar.info("⚠️ Configure EMAIL_REMETENTE e SENHA_APP no arquivo .env para enviar e-mails.")
+    st.sidebar.info("⚠️ Configure EMAIL_REMETENTE e SENHA_APP (Secrets no Streamlit Cloud / .env local) para enviar e-mails.")
 
 st.sidebar.title("Navegação")
 pagina = st.sidebar.selectbox("Escolha a página", ["Área do Cliente", "Área Jusreport"])
+
 
 # =====================================================================
 # ÁREA DO CLIENTE
@@ -329,6 +324,7 @@ if pagina == "Área do Cliente":
                     with st.expander("📄 Detalhes técnicos (traceback)"):
                         st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
+
 # =====================================================================
 # ÁREA INTERNA (JUSREPORT / ADVOGADO)
 # =====================================================================
@@ -336,12 +332,10 @@ elif pagina == "Área Jusreport":
     st.title("Área Interna - JusReport")
 
     health = api_health()
-
-    # Debug opcional do /health (tanto sucesso quanto erro de conexão)
     with st.expander("🔎 Debug /health da API", expanded=False):
         st.json(health)
 
-    api_reachable = health.get("api_reachable", True)
+    api_reachable = bool(health.get("api_reachable"))
     gemini_ok = bool(health.get("gemini_configured"))
 
     if not api_reachable:
@@ -351,14 +345,7 @@ elif pagina == "Área Jusreport":
             f"Detalhe técnico: {health.get('error')}"
         )
     elif not gemini_ok:
-        st.error(
-            "GEMINI_API_KEY não configurada na API do Render. "
-            "Defina GEMINI_API_KEY nas variáveis de ambiente do serviço da API e faça redeploy."
-        )
-
-    # Se a API não está acessível, não adianta seguir
-    if not api_reachable:
-        st.stop()
+        st.error("GEMINI_API_KEY não configurada no servidor da API. Configure no Render e reinicie a API.")
 
     # Login persistente
     if "auth_ok" not in st.session_state:
@@ -424,9 +411,9 @@ elif pagina == "Área Jusreport":
                             st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
             with col3:
-                if not gemini_ok:
+                if (not api_reachable) or (not gemini_ok):
                     st.button("Processar automaticamente", key=f"processar_{row['id']}", disabled=True)
-                    st.caption("Ative GEMINI_API_KEY para liberar o processamento automático.")
+                    st.caption("Ative a API/Gemini para liberar o processamento automático.")
                 else:
                     if st.button("Processar automaticamente", key=f"processar_{row['id']}"):
                         try:
@@ -475,7 +462,6 @@ elif pagina == "Área Jusreport":
 
                                 # 3) Sumarização (multiagentes Execução)
                                 with st.spinner("Gerando sumarização com IA (multiagentes)..."):
-                                    # Query "densa" que descreve tudo o que queremos
                                     query_densa = (
                                         "Gerar relatório completo da execução, contemplando: "
                                         "Cabeçalho (Número dos autos, Classe, Vara, Comarca, Data da distribuição, "
