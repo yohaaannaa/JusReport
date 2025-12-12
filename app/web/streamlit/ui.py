@@ -1,9 +1,9 @@
 import os, sys, time, traceback
 from datetime import datetime
+from io import BytesIO
+from typing import Optional
 
 # ================= AJUSTE DE PATH PARA IMPORTAR app.* =================
-# ui.py está em: JusReport/app/web/streamlit/ui.py
-# Então o root do projeto é três níveis acima: JusReport
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -13,32 +13,11 @@ import base64
 import smtplib
 import ssl
 from email.message import EmailMessage
-from io import BytesIO
-from typing import Optional
 
 import pandas as pd
 import requests
 import streamlit as st
 from dotenv import load_dotenv
-
-# openpyxl é opcional na nuvem
-try:
-    import openpyxl  # noqa: F401
-    OPENPYXL_OK = True
-except Exception:
-    OPENPYXL_OK = False
-
-# ---- Defensivo: variável 'hora' para qualquer código legado que a use ----
-hora = datetime.now().strftime("%H-%M-%S")
-
-# ---- Tipos de sumarização disponíveis ----
-SUMARIZACOES_DISPONIVEIS = [
-    "Execução",
-    "Ação de Cobrança",
-    "Ação Monitória",
-    "Embargos à Execução",
-    "Reintegração de Posse",
-]
 
 # ==== IMPORTA UTILITÁRIOS DO PROJETO (banco e arquivos) ====
 from app.utils.db import (  # type: ignore
@@ -51,22 +30,29 @@ from app.utils.db import (  # type: ignore
 )
 
 # ========= CONFIGURAÇÕES =========
-# Carrega o .env da RAIZ do projeto (local). Na nuvem (Streamlit Cloud), Secrets já viram env vars.
+# Local: lê .env. Cloud: Secrets já viram env vars.
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 RELATORIOS_DIR = str(REL_DIR)
 API_BASE = os.getenv("JUSREPORT_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-# ========= AJUSTES INICIAIS =========
-os.makedirs(RELATORIOS_DIR, exist_ok=True)
-
-# ========= CARREGAR VARIÁVEIS SECRETAS =========
 EMAIL_REMETENTE = os.getenv("EMAIL_REMETENTE")
 SENHA_APP = os.getenv("SENHA_APP")
 SENHA_ADVOGADO = os.getenv("SENHA_ADVOGADO", "123cas#@!adv")
 
+MAX_TEXT_CHARS_UI = int(os.getenv("MAX_TEXT_CHARS_UI", "60000"))
 
-# ========= FUNÇÕES =========
+SUMARIZACOES_DISPONIVEIS = [
+    "Execução",
+    "Ação de Cobrança",
+    "Ação Monitória",
+    "Embargos à Execução",
+    "Reintegração de Posse",
+]
+
+os.makedirs(RELATORIOS_DIR, exist_ok=True)
+
+# ========= HELPERS =========
 def _guess_mime(filename: str) -> str:
     lower = filename.lower()
     if lower.endswith(".pdf"):
@@ -76,10 +62,82 @@ def _guess_mime(filename: str) -> str:
     return "application/octet-stream"
 
 
+def _api_request(method: str, path: str, *, timeout: int = 60, retries: int = 2, **kwargs):
+    """
+    Render Free pode dormir. Aqui a gente tenta algumas vezes com timeout alto.
+    """
+    url = f"{API_BASE}{path}"
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.request(method, url, timeout=timeout, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(2.0 + attempt * 1.5)
+            else:
+                raise last_err
+
+
+def api_health() -> dict:
+    try:
+        r = _api_request("GET", "/health", timeout=90, retries=2)
+        data = r.json()
+        data["api_reachable"] = True
+        return data
+    except Exception as e:
+        return {"service": "jusreport-api", "api_reachable": False, "gemini_configured": False, "error": str(e)}
+
+
+def api_export_docx(content_markdown: str, filename: str) -> bytes:
+    r = _api_request(
+        "POST",
+        "/export/docx",
+        timeout=180,
+        retries=1,
+        data={"content": content_markdown, "filename": filename},
+    )
+    return r.content
+
+
+def api_summarize_text(text: str, case_number: str, action_type: str) -> dict:
+    """
+    CHAMADA PRINCIPAL (cloud-friendly): manda TEXTO para a API (sem upload de PDF).
+    """
+    payload = {"text": text, "case_number": case_number, "action_type": action_type}
+    r = _api_request("POST", "/summarize_text", timeout=900, retries=0, json=payload)
+    return r.json()
+
+
+def extrair_texto_pdf_local(pdf_path: str, max_chars: int = 60000) -> str:
+    """
+    Extrai texto do PDF no próprio Streamlit (Cloud/local), evitando /ingest no Render.
+    """
+    try:
+        import pdfplumber
+    except Exception as e:
+        raise RuntimeError(f"pdfplumber não está instalado no Streamlit: {e}")
+
+    partes = []
+    total = 0
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if t.strip():
+                partes.append(t)
+                total += len(t)
+            if total >= max_chars:
+                break
+
+    texto = "\n\n".join(partes).strip()
+    if len(texto) > max_chars:
+        texto = texto[:max_chars]
+    return texto
+
+
 def enviar_email_cliente(destinatario: str, relatorio_path: str, numero_processo: str) -> None:
-    """
-    Envia o .docx ao cliente. Se credenciais não estiverem configuradas, apenas avisa no UI.
-    """
     if not EMAIL_REMETENTE or not SENHA_APP:
         st.warning("⚠️ Credenciais de e-mail não configuradas. Relatório NÃO foi enviado por e-mail.")
         return
@@ -125,104 +183,33 @@ def exibir_logo_e_titulo_lado_a_lado() -> None:
         st.markdown(html, unsafe_allow_html=True)
 
 
-# --------- CHAMADAS À API (FastAPI) ---------
-def api_health() -> dict:
-    """
-    Render pode demorar no primeiro request (spin-down). Timeout 60s evita falso negativo.
-    """
-    try:
-        r = requests.get(f"{API_BASE}/health", timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        data["api_reachable"] = True
-        return data
-    except Exception as e:
-        return {
-            "service": "jusreport-api",
-            "api_reachable": False,
-            "gemini_configured": False,
-            "error": str(e),
-        }
-
-
-def api_ingest(file_path: str, case_number: str, client_id: Optional[str] = None) -> dict:
-    """
-    Upload pode demorar (PDF grande) → timeout maior.
-    """
-    url = f"{API_BASE}/ingest"
-    with open(file_path, "rb") as f:
-        files = [("files", (os.path.basename(file_path), f, _guess_mime(file_path)))]
-        data = {"case_number": case_number}
-        if client_id:
-            data["client_id"] = client_id
-        resp = requests.post(url, files=files, data=data, timeout=180)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def api_status(job_id: str) -> dict:
-    url = f"{API_BASE}/status/{job_id}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def api_summarize(question: str, case_number: str, action_type: str, k: int = 100, return_json: bool = True) -> dict:
-    """
-    Timeout grande porque o backend faz múltiplas chamadas ao Gemini.
-    """
-    url = f"{API_BASE}/summarize"
-    payload = {
-        "question": question,
-        "case_number": case_number,
-        "k": k,
-        "return_json": return_json,
-        "action_type": action_type,
-    }
-    resp = requests.post(url, json=payload, timeout=600)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def api_export_docx(content_markdown: str, filename: str) -> bytes:
-    url = f"{API_BASE}/export/docx"
-    data = {"content": content_markdown, "filename": filename}
-    resp = requests.post(url, data=data, timeout=120)
-    resp.raise_for_status()
-    return resp.content
-
-
-# --------- CAMADAS DE DADOS UTILIZANDO app.utils.db ---------
+# ========= BANCO (helpers) =========
 def carregar_processos_pendentes_df() -> pd.DataFrame:
     rows = listar_processos(status="pendente")
     if not rows:
-        return pd.DataFrame(
-            columns=["id", "nome_cliente", "email", "numero_processo", "tipo", "conferencia", "data_envio", "caminho_arquivo"]
-        )
+        return pd.DataFrame(columns=["id","nome_cliente","email","numero_processo","tipo","conferencia","data_envio","caminho_arquivo"])
     df = pd.DataFrame(rows)
-    expected_cols = ["id", "nome_cliente", "email", "numero_processo", "tipo", "conferencia", "data_envio", "caminho_arquivo"]
-    for c in expected_cols:
+    for c in ["id","nome_cliente","email","numero_processo","tipo","conferencia","data_envio","caminho_arquivo"]:
         if c not in df.columns:
             df[c] = None
-    return df[expected_cols].sort_values(by="data_envio", ascending=False)
+    return df[["id","nome_cliente","email","numero_processo","tipo","conferencia","data_envio","caminho_arquivo"]].sort_values(by="data_envio", ascending=False)
 
 
 def carregar_processos_finalizados_df() -> pd.DataFrame:
     rows = listar_processos(status="finalizado")
     if not rows:
-        return pd.DataFrame(columns=["nome_cliente", "email", "numero_processo", "data_envio", "caminho_arquivo"])
+        return pd.DataFrame(columns=["nome_cliente","email","numero_processo","data_envio","caminho_arquivo"])
     df = pd.DataFrame(rows)
-    cols = ["nome_cliente", "email", "numero_processo", "data_envio", "caminho_arquivo"]
-    for c in cols:
+    for c in ["nome_cliente","email","numero_processo","data_envio","caminho_arquivo"]:
         if c not in df.columns:
             df[c] = None
-    return df[cols].sort_values(by="data_envio", ascending=False)
+    return df[["nome_cliente","email","numero_processo","data_envio","caminho_arquivo"]].sort_values(by="data_envio", ascending=False)
 
 
 def carregar_contagem_processos_mensal_df() -> pd.DataFrame:
     rows = listar_processos(status=None)
     if not rows:
-        return pd.DataFrame(columns=["nome_cliente", "email", "mes_ano", "quantidade"])
+        return pd.DataFrame(columns=["nome_cliente","email","mes_ano","quantidade"])
     df = pd.DataFrame(rows)
     df["data_envio"] = pd.to_datetime(df["data_envio"], errors="coerce")
     df["mes_ano"] = df["data_envio"].dt.strftime("%m/%Y")
@@ -257,12 +244,11 @@ def finalizar_processo_e_enviar(processo_id: str, relatorio_path: str, email_cli
 # ========= APP STREAMLIT =========
 st.set_page_config(page_title="JusReport", page_icon="⚖️", layout="wide")
 
-st.sidebar.title("Navegação")
-pagina = st.sidebar.selectbox("Escolha a página", ["Área do Cliente", "Área Jusreport"])
-
 if not EMAIL_REMETENTE or not SENHA_APP:
     st.sidebar.info("⚠️ Configure EMAIL_REMETENTE e SENHA_APP (Secrets no Streamlit Cloud / .env local) para enviar e-mails.")
 
+st.sidebar.title("Navegação")
+pagina = st.sidebar.selectbox("Escolha a página", ["Área do Cliente", "Área Jusreport"])
 
 # =====================================================================
 # ÁREA DO CLIENTE
@@ -275,11 +261,7 @@ if pagina == "Área do Cliente":
         email = st.text_input("E-mail para receber o relatório")
         numero = st.text_input("Número do processo")
         tipo = st.selectbox("Tipo de sumarização", SUMARIZACOES_DISPONIVEIS, index=0)
-        conferencia = st.radio(
-            "Tipo de relatório desejado:",
-            ["Conferido por um advogado", "Sem conferência"],
-            index=0,
-        )
+        conferencia = st.radio("Tipo de relatório desejado:", ["Conferido por um advogado", "Sem conferência"], index=0)
         arquivo = st.file_uploader("Anexar arquivo do processo (PDF, DOCX)", type=["pdf", "docx"])
         enviado = st.form_submit_button("Enviar processo")
 
@@ -295,14 +277,12 @@ if pagina == "Área do Cliente":
                     with st.expander("📄 Detalhes técnicos (traceback)"):
                         st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
-
 # =====================================================================
-# ÁREA INTERNA (JUSREPORT / ADVOGADO)
+# ÁREA INTERNA
 # =====================================================================
-elif pagina == "Área Jusreport":
+else:
     st.title("Área Interna - JusReport")
 
-    # --- Diagnóstico API ---
     health = api_health()
     with st.expander("🔎 Debug /health da API", expanded=False):
         st.json(health)
@@ -313,13 +293,11 @@ elif pagina == "Área Jusreport":
     if not api_reachable:
         st.error(
             f"Não foi possível conectar na API em {API_BASE}. "
-            f"Verifique a variável JUSREPORT_API_URL no Streamlit Cloud. "
             f"Detalhe técnico: {health.get('error')}"
         )
     elif not gemini_ok:
-        st.error("GEMINI_API_KEY não configurada no servidor da API. Configure no Render e reinicie a API.")
+        st.error("Gemini não está configurado na API (Render). Configure GEMINI_API_KEY no Render e redeploy.")
 
-    # --- Login persistente ---
     if "auth_ok" not in st.session_state:
         st.session_state["auth_ok"] = False
 
@@ -336,12 +314,11 @@ elif pagina == "Área Jusreport":
     # -------- Processos Pendentes --------
     st.subheader("Processos Pendentes")
 
-    # IMPORTANTÍSSIMO: não derrubar o app se SQLite falhar (na nuvem ele redige)
     try:
         df = carregar_processos_pendentes_df()
     except Exception as e:
-        st.error("Falha ao acessar o banco SQLite no Streamlit Cloud. Verifique os Logs (Manage app → Logs).")
-        st.exception(e)
+        st.error("Falha ao acessar o banco SQLite. Verifique os Logs (Manage app → Logs).")
+        st.code(str(e))
         st.stop()
 
     if df.empty:
@@ -355,33 +332,34 @@ elif pagina == "Área Jusreport":
             st.markdown(f"**Tipo de sumarização:** {row['tipo']}")
             st.markdown(f"**Tipo de relatório:** {row['conferencia']}")
 
-            data_fmt = row.get("data_envio")
+            data_fmt = row["data_envio"]
             try:
-                data_fmt = pd.to_datetime(row.get("data_envio")).strftime("%d/%m/%Y %H:%M")
+                data_fmt = pd.to_datetime(row["data_envio"]).strftime("%d/%m/%Y %H:%M")
             except Exception:
                 pass
             st.markdown(f"**Data de envio:** {data_fmt}")
 
             col1, col2, col3 = st.columns([2, 1, 1])
 
+            caminho_cliente = row.get("caminho_arquivo")
+
             with col1:
-                caminho_cliente = row.get("caminho_arquivo")
                 if caminho_cliente and os.path.exists(caminho_cliente):
                     with open(caminho_cliente, "rb") as file:
                         st.download_button(
                             label="Baixar arquivo do cliente",
                             data=file,
                             file_name=os.path.basename(caminho_cliente),
-                            mime="application/octet-stream",
+                            mime=_guess_mime(caminho_cliente),
                             key=f"download_{row['id']}",
                         )
                 else:
-                    st.warning("Arquivo original não encontrado no disco.")
+                    st.warning("Arquivo original não encontrado no disco (provavelmente caminho antigo).")
 
             with col2:
                 if st.button("Excluir", key=f"excluir_{row['id']}"):
                     try:
-                        excluir_processo_e_arquivo(row["id"], row.get("caminho_arquivo"))
+                        excluir_processo_e_arquivo(row["id"], caminho_cliente)
                         st.success(f"Processo de {row['nome_cliente']} excluído.")
                         st.rerun()
                     except Exception as e:
@@ -390,135 +368,69 @@ elif pagina == "Área Jusreport":
                             st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
             with col3:
-                if (not api_reachable) or (not gemini_ok):
-                    st.button("Processar automaticamente", key=f"processar_{row['id']}", disabled=True)
-                    st.caption("Ative a API/Gemini para liberar o processamento automático.")
-                else:
-                    if st.button("Processar automaticamente", key=f"processar_{row['id']}"):
+                disabled = (not api_reachable) or (not gemini_ok) or (not caminho_cliente) or (not os.path.exists(caminho_cliente))
+                if st.button("Processar automaticamente", key=f"processar_{row['id']}", disabled=disabled):
+                    try:
+                        log = st.expander("🔎 Log de processamento", expanded=True)
+
+                        with st.spinner("Extraindo texto do PDF (no Streamlit)..."):
+                            texto_pdf = extrair_texto_pdf_local(caminho_cliente, max_chars=MAX_TEXT_CHARS_UI)
+
+                        if not texto_pdf.strip():
+                            st.error("A IA não retornou conteúdo para o relatório (texto do PDF vazio/ilegível).")
+                            st.stop()
+
+                        with st.spinner("Gerando sumarização com IA (Render)..."):
+                            sum_resp = api_summarize_text(
+                                text=texto_pdf,
+                                case_number=str(row["numero_processo"]),
+                                action_type=str(row["tipo"]),
+                            )
+
+                        summary_md = (sum_resp.get("summary_markdown", "") or "").strip()
+                        if not summary_md:
+                            st.error("A IA não retornou conteúdo para o relatório.")
+                            st.stop()
+
+                        st.markdown("**Prévia do relatório:**")
+                        st.markdown(summary_md)
+
+                        nome_saida = f"Sum_{row['numero_processo']}.docx"
+                        with st.spinner("Exportando relatório para DOCX..."):
+                            docx_bytes = api_export_docx(summary_md, nome_saida)
+
+                        caminho_relatorio = os.path.join(RELATORIOS_DIR, nome_saida)
+                        with open(caminho_relatorio, "wb") as out:
+                            out.write(docx_bytes)
+
+                        registrar_relatorio(row["id"], caminho_docx=caminho_relatorio)
+
+                        if str(row.get("conferencia", "")).strip().lower().startswith("sem"):
+                            finalizar_processo_e_enviar(row["id"], caminho_relatorio, row["email"], str(row["numero_processo"]))
+                            st.success("Relatório gerado, finalizado e enviado ao cliente!")
+                        else:
+                            st.success("Relatório gerado e salvo para conferência do advogado.")
+
+                        st.rerun()
+
+                    except requests.HTTPError as e:
                         try:
-                            if not caminho_cliente or not os.path.exists(caminho_cliente):
-                                st.error("Arquivo do cliente não encontrado para processar.")
-                            else:
-                                st.expander("🔎 Log de processamento", expanded=True)
+                            st.error(f"Falha na API: {e.response.json()}")
+                        except Exception:
+                            st.error(f"Falha na API: {e}")
+                        with st.expander("📄 Detalhes técnicos (traceback)"):
+                            st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                    except Exception as e:
+                        st.error(f"Erro no processamento automático: {e}")
+                        with st.expander("📄 Detalhes técnicos (traceback)"):
+                            st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
-                                # 1) Ingest
-                                with st.spinner("Iniciando ingestão (upload para API)..."):
-                                    resp = api_ingest(
-                                        file_path=caminho_cliente,
-                                        case_number=str(row["numero_processo"]),
-                                        client_id=row["email"],
-                                    )
-                                job_id = resp.get("job_id")
-                                if not job_id:
-                                    st.error(f"Falha ao iniciar ingestão: {resp}")
-                                    st.stop()
-
-                                # 2) Polling de status
-                                pbar = st.progress(0)
-                                status_area = st.empty()
-                                while True:
-                                    time.sleep(1.5)
-                                    try:
-                                        st_status = api_status(job_id)
-                                    except Exception as e:
-                                        status_area.error(f"Falha ao consultar status: {e}")
-                                        break
-
-                                    prog = int(st_status.get("progress", 0))
-                                    detail = st_status.get("detail", "")
-                                    pbar.progress(min(max(prog, 0), 100))
-                                    status_area.info(f"Status do índice: {prog}% - {detail}")
-
-                                    if st_status.get("status") in ("done", "error"):
-                                        if st_status.get("status") == "done":
-                                            status_area.success("Ingestão concluída.")
-                                        else:
-                                            st.error(f"Ingestão falhou: {st_status.get('detail')}")
-                                        break
-
-                                if st_status.get("status") != "done":
-                                    st.stop()
-
-                                # 3) Sumarização
-                                with st.spinner("Gerando sumarização com IA (multiagentes)..."):
-                                    query_densa = (
-                                        "Gerar relatório completo da execução, contemplando: "
-                                        "Cabeçalho (Número dos autos, Classe, Vara, Comarca, Data da distribuição, "
-                                        "Exequente, Executados, Advogados, Valor da causa, Valor atualizado, "
-                                        "Operação financeira, Número da operação, Valor da operação, Datas, Garantias); "
-                                        "Resumo da Inicial (origem da dívida, contrato/confissão de dívida, cheques, multa, penhor mercantil); "
-                                        "Tentativas de Penhora Online (RENAJUD, SISBAJUD, INFOJUD, SERASAJUD) e garantias; "
-                                        "Movimentações Processuais relevantes em ordem cronológica; "
-                                        "Análise Jurídica (partes, advogados, garantias, citações, penhoras, planilhas, defesas, embargos, "
-                                        "prescrição, paralisações)."
-                                    )
-
-                                    sum_resp = api_summarize(
-                                        question=query_densa,
-                                        case_number=str(row["numero_processo"]),
-                                        action_type=str(row["tipo"]),
-                                        k=100,
-                                        return_json=True,
-                                    )
-
-                                summary_md = (sum_resp.get("summary_markdown", "") or "").strip()
-                                if summary_md:
-                                    st.markdown("**Prévia do relatório:**")
-                                    st.markdown(summary_md)
-                                else:
-                                    st.error("A IA não retornou conteúdo para o relatório.")
-                                    st.stop()
-
-                                # 4) Export DOCX
-                                nome_saida = f"Sum_{row['numero_processo']}.docx"
-                                with st.spinner("Exportando relatório para DOCX..."):
-                                    docx_bytes = api_export_docx(content_markdown=summary_md, filename=nome_saida)
-
-                                caminho_relatorio = os.path.join(RELATORIOS_DIR, nome_saida)
-                                if not docx_bytes:
-                                    st.error("Falha ao gerar DOCX (resposta vazia).")
-                                    st.stop()
-
-                                with open(caminho_relatorio, "wb") as out:
-                                    out.write(docx_bytes)
-
-                                if (not os.path.exists(caminho_relatorio)) or (os.path.getsize(caminho_relatorio) == 0):
-                                    st.error("Arquivo DOCX não foi salvo corretamente.")
-                                    st.stop()
-
-                                registrar_relatorio(row["id"], caminho_docx=caminho_relatorio)
-
-                                # Se o cliente escolheu "Sem conferência", já envia por e-mail
-                                if str(row.get("conferencia", "")).strip().lower().startswith("sem"):
-                                    finalizar_processo_e_enviar(
-                                        row["id"], caminho_relatorio, row["email"], str(row["numero_processo"])
-                                    )
-                                    st.success("Relatório gerado, finalizado e enviado ao cliente!")
-                                else:
-                                    st.success("Relatório gerado e salvo para conferência do advogado.")
-                                st.rerun()
-
-                        except requests.HTTPError as e:
-                            try:
-                                st.error(f"Falha na API: {e.response.json()}")
-                            except Exception:
-                                st.error(f"Falha na API: {e}")
-                            with st.expander("📄 Detalhes técnicos (traceback)"):
-                                st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
-                        except Exception as e:
-                            st.error(f"Erro no processamento automático: {e}")
-                            with st.expander("📄 Detalhes técnicos (traceback)"):
-                                st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                if disabled:
+                    st.caption("⚠️ Para processar: API ok + Gemini ok + arquivo precisa existir no servidor do Streamlit.")
 
     # -------- Relatórios Finalizados --------
     st.subheader("Relatórios Finalizados")
-
-    try:
-        df_finalizados = carregar_processos_finalizados_df()
-    except Exception as e:
-        st.error("Falha ao acessar o banco SQLite para carregar relatórios finalizados.")
-        st.exception(e)
-        st.stop()
+    df_finalizados = carregar_processos_finalizados_df()
 
     if df_finalizados.empty:
         st.info("Nenhum relatório finalizado encontrado ainda.")
@@ -530,8 +442,8 @@ elif pagina == "Área Jusreport":
 
         st.dataframe(df_finalizados.drop(columns=["caminho_arquivo"], errors="ignore"))
 
-        # Export em Excel se openpyxl disponível; senão cai para CSV
-        if OPENPYXL_OK:
+        # Export: tenta Excel (openpyxl), se não tiver, cai pra CSV
+        try:
             output_finalizados = BytesIO()
             with pd.ExcelWriter(output_finalizados, engine="openpyxl") as writer:
                 df_finalizados.drop(columns=["caminho_arquivo"], errors="ignore").to_excel(
@@ -543,9 +455,8 @@ elif pagina == "Área Jusreport":
                 file_name="relatorios_finalizados.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-        else:
+        except Exception:
             csv_bytes = df_finalizados.drop(columns=["caminho_arquivo"], errors="ignore").to_csv(index=False).encode("utf-8")
-            st.warning("openpyxl não está instalado no Streamlit Cloud. Exportando em CSV.")
             st.download_button(
                 label="Baixar Relatórios Finalizados (CSV)",
                 data=csv_bytes,
@@ -555,18 +466,11 @@ elif pagina == "Área Jusreport":
 
     # -------- Relatório Mensal --------
     st.subheader("Relatório Mensal de Processos por Cliente")
-
-    try:
-        df_contagem = carregar_contagem_processos_mensal_df()
-    except Exception as e:
-        st.error("Falha ao acessar o banco SQLite para gerar relatório mensal.")
-        st.exception(e)
-        st.stop()
-
+    df_contagem = carregar_contagem_processos_mensal_df()
     if not df_contagem.empty:
         st.dataframe(df_contagem)
 
-        if OPENPYXL_OK:
+        try:
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 df_contagem.to_excel(writer, index=False, sheet_name="RelatorioMensal")
@@ -576,9 +480,8 @@ elif pagina == "Área Jusreport":
                 file_name="relatorio_mensal_processos.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-        else:
+        except Exception:
             csv_bytes = df_contagem.to_csv(index=False).encode("utf-8")
-            st.warning("openpyxl não está instalado no Streamlit Cloud. Exportando em CSV.")
             st.download_button(
                 label="Baixar Relatório Mensal (CSV)",
                 data=csv_bytes,
