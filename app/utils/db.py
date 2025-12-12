@@ -6,56 +6,45 @@ from pathlib import Path
 
 
 # ============================================================
-# PATHS COMPATÍVEIS COM LOCAL + STREAMLIT CLOUD
+# DATA DIR: local (repo/data) vs cloud (/tmp)
 # ============================================================
 
-def _resolve_data_dir() -> Path:
-    """
-    Onde o SQLite e os arquivos (uploads/relatorios) serão gravados.
-
-    - LOCAL (Windows): usa <projeto>/data
-    - STREAMLIT CLOUD (Linux): usa /tmp/jusreport_data (sempre gravável)
-
-    Se você quiser forçar manualmente um caminho (ex.: um volume),
-    defina: JUSREPORT_DATA_DIR=/algum/caminho
-    """
-    env_dir = os.getenv("JUSREPORT_DATA_DIR")
-    if env_dir:
-        p = Path(env_dir).expanduser().resolve()
+def _data_dir() -> Path:
+    # Se quiser forçar via env:
+    forced = os.getenv("JUSREPORT_DATA_DIR")
+    if forced:
+        p = Path(forced).expanduser().resolve()
         p.mkdir(exist_ok=True, parents=True)
         return p
 
-    # Linux (Streamlit Cloud / Render etc.)
+    # Streamlit Cloud roda em Linux -> /tmp é gravável
     if os.name != "nt":
         p = Path("/tmp/jusreport_data")
         p.mkdir(exist_ok=True, parents=True)
         return p
 
-    # Windows local: raiz do projeto = subir 3 níveis (app/utils/db.py -> JusReport)
-    base_dir = Path(__file__).resolve().parents[2]
+    # Windows local: raiz do projeto
+    base_dir = Path(__file__).resolve().parents[2]  # JusReport/app/utils/db.py -> JusReport
     p = base_dir / "data"
     p.mkdir(exist_ok=True, parents=True)
     return p
 
 
-DATA_DIR = _resolve_data_dir()
-
+DATA_DIR = _data_dir()
 UPLOAD_DIR = DATA_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
-
 REL_DIR = DATA_DIR / "relatorios"
+UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
 REL_DIR.mkdir(exist_ok=True, parents=True)
 
 DB_PATH = DATA_DIR / "banco_dados.db"
 
 
 # ============================================================
-# SQLITE: conexão + init
+# SQLITE: conexão + init (com retry)
 # ============================================================
 
 def _get_conn() -> sqlite3.Connection:
-    # timeout evita falhas em lock; check_same_thread=False ajuda no Streamlit
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -63,10 +52,6 @@ def _get_conn() -> sqlite3.Connection:
 def _init_db() -> None:
     conn = _get_conn()
     cur = conn.cursor()
-
-    # Mantive os nomes das colunas do seu schema para não quebrar seu UI:
-    # - status
-    # - caminho_relatorio
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS processos (
@@ -83,28 +68,21 @@ def _init_db() -> None:
         )
         """
     )
-
     conn.commit()
     conn.close()
 
 
+# inicializa sempre
 _init_db()
 
 
 # ============================================================
-# CRUD
+# FUNÇÕES PÚBLICAS
 # ============================================================
 
-def salvar_processo(
-    nome_cliente: str,
-    email: str,
-    numero: str,
-    tipo: str,
-    arquivo,  # Streamlit UploadedFile
-    conferencia: str
-) -> str:
+def salvar_processo(nome_cliente: str, email: str, numero: str, tipo: str, arquivo, conferencia: str) -> str:
     """
-    Salva o arquivo no disco e registra no banco como 'pendente'.
+    Salva o processo no disco e registra no banco como 'pendente'.
     """
     from uuid import uuid4
 
@@ -112,14 +90,10 @@ def salvar_processo(
 
     proc_id = str(uuid4())
 
-    # Nome do arquivo: tenta manter extensão original
     ext = os.path.splitext(getattr(arquivo, "name", "") or "")[1] or ".bin"
     file_name = f"{proc_id}{ext}"
     file_path = UPLOAD_DIR / file_name
 
-    # Streamlit UploadedFile:
-    # - pode ter .getbuffer() (recomendado)
-    # - ou .getvalue()
     try:
         content = arquivo.getbuffer()
     except Exception:
@@ -155,40 +129,44 @@ def salvar_processo(
 
 
 def listar_processos(status: Optional[str] = None) -> List[Dict[str, Any]]:
-    _init_db()
+    """
+    ULTRA-DEFENSIVO: se o banco estiver corrompido, inacessível ou a tabela não existir,
+    reinicializa e devolve lista vazia (sem derrubar o app).
+    """
+    try:
+        _init_db()
+        conn = _get_conn()
+        cur = conn.cursor()
 
-    conn = _get_conn()
-    cur = conn.cursor()
+        if status:
+            cur.execute("SELECT * FROM processos WHERE status = ? ORDER BY data_envio DESC", (status,))
+        else:
+            cur.execute("SELECT * FROM processos ORDER BY data_envio DESC")
 
-    if status:
-        cur.execute(
-            "SELECT * FROM processos WHERE status = ? ORDER BY data_envio DESC",
-            (status,),
-        )
-    else:
-        cur.execute("SELECT * FROM processos ORDER BY data_envio DESC")
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
 
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
+    except sqlite3.OperationalError:
+        # tenta reinicializar e não derruba o app
+        try:
+            _init_db()
+        except Exception:
+            pass
+        return []
 
 
 def atualizar_status(proc_id: str, novo_status: str) -> None:
     _init_db()
-
     conn = _get_conn()
     cur = conn.cursor()
-    cur.execute(
-        "UPDATE processos SET status = ? WHERE id = ?",
-        (novo_status, proc_id),
-    )
+    cur.execute("UPDATE processos SET status = ? WHERE id = ?", (novo_status, proc_id))
     conn.commit()
     conn.close()
 
 
 def registrar_relatorio(proc_id: str, caminho_docx: str) -> None:
     _init_db()
-
     conn = _get_conn()
     cur = conn.cursor()
     cur.execute(
