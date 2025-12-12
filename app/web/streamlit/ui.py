@@ -167,10 +167,12 @@ def api_status(job_id: str) -> dict:
     return resp.json()
 
 
-def api_summarize(question: str, case_number: str, action_type: str, k: int = 100, return_json: bool = True) -> dict:
+def api_summarize_async(question: str, case_number: str, action_type: str, k: int = 100, return_json: bool = True) -> dict:
     """
-    Chama /summarize da API.
-    Timeout grande porque o backend faz múltiplas chamadas ao Gemini.
+    NOVO: /summarize agora é assíncrono na API.
+    Ele retorna rápido {"job_id": "...", "status": "queued"}.
+    Depois você consulta /status/{job_id} até status == "done"
+    e lê result["summary_markdown"].
     """
     url = f"{API_BASE}/summarize"
     payload = {
@@ -180,7 +182,8 @@ def api_summarize(question: str, case_number: str, action_type: str, k: int = 10
         "return_json": return_json,
         "action_type": action_type,
     }
-    resp = requests.post(url, json=payload, timeout=600)
+    # Agora pode ser curto, porque o backend não processa no request.
+    resp = requests.post(url, json=payload, timeout=60)
     resp.raise_for_status()
     return resp.json()
 
@@ -274,6 +277,22 @@ def excluir_processo_e_arquivo(processo_id: str, caminho_arquivo: str) -> None:
 def finalizar_processo_e_enviar(processo_id: str, relatorio_path: str, email_cliente: str, numero_processo: str) -> None:
     atualizar_status(processo_id, "finalizado")
     enviar_email_cliente(email_cliente, relatorio_path, numero_processo)
+
+
+def _df_to_excel_bytes_or_none(df: pd.DataFrame, sheet_name: str) -> Optional[bytes]:
+    """
+    Exporta DF para Excel (openpyxl). Se openpyxl não existir (Streamlit Cloud),
+    retorna None para a UI oferecer CSV.
+    """
+    try:
+        import openpyxl  # noqa: F401
+    except Exception:
+        return None
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
 
 
 # ========= APP STREAMLIT =========
@@ -434,11 +453,11 @@ elif pagina == "Área Jusreport":
                                     st.error(f"Falha ao iniciar ingestão: {resp}")
                                     st.stop()
 
-                                # 2) Polling de status
+                                # 2) Polling de status (ingest)
                                 pbar = st.progress(0)
                                 status_area = st.empty()
                                 while True:
-                                    time.sleep(1.5)
+                                    time.sleep(1.2)
                                     try:
                                         st_status = api_status(job_id)
                                     except Exception as e:
@@ -460,21 +479,21 @@ elif pagina == "Área Jusreport":
                                 if st_status.get("status") != "done":
                                     st.stop()
 
-                                # 3) Sumarização (multiagentes Execução)
-                                with st.spinner("Gerando sumarização com IA (multiagentes)..."):
-                                    query_densa = (
-                                        "Gerar relatório completo da execução, contemplando: "
-                                        "Cabeçalho (Número dos autos, Classe, Vara, Comarca, Data da distribuição, "
-                                        "Exequente, Executados, Advogados, Valor da causa, Valor atualizado, "
-                                        "Operação financeira, Número da operação, Valor da operação, Datas, Garantias); "
-                                        "Resumo da Inicial (origem da dívida, contrato/confissão de dívida, cheques, multa, penhor mercantil); "
-                                        "Tentativas de Penhora Online (RENAJUD, SISBAJUD, INFOJUD, SERASAJUD) e garantias; "
-                                        "Movimentações Processuais relevantes em ordem cronológica; "
-                                        "Análise Jurídica (partes, advogados, garantias, citações, penhoras, planilhas, defesas, embargos, "
-                                        "prescrição, paralisações)."
-                                    )
+                                # 3) Disparar sumarização ASSÍNCRONA
+                                query_densa = (
+                                    "Gerar relatório completo da execução, contemplando: "
+                                    "Cabeçalho (Número dos autos, Classe, Vara, Comarca, Data da distribuição, "
+                                    "Exequente, Executados, Advogados, Valor da causa, Valor atualizado, "
+                                    "Operação financeira, Número da operação, Valor da operação, Datas, Garantias); "
+                                    "Resumo da Inicial (origem da dívida, contrato/confissão de dívida, cheques, multa, penhor mercantil); "
+                                    "Tentativas de Penhora Online (RENAJUD, SISBAJUD, INFOJUD, SERASAJUD) e garantias; "
+                                    "Movimentações Processuais relevantes em ordem cronológica; "
+                                    "Análise Jurídica (partes, advogados, garantias, citações, penhoras, planilhas, defesas, embargos, "
+                                    "prescrição, paralisações)."
+                                )
 
-                                    sum_resp = api_summarize(
+                                with st.spinner("Iniciando sumarização (fila assíncrona na API)..."):
+                                    sum_start = api_summarize_async(
                                         question=query_densa,
                                         case_number=str(row["numero_processo"]),
                                         action_type=str(row["tipo"]),
@@ -482,7 +501,53 @@ elif pagina == "Área Jusreport":
                                         return_json=True,
                                     )
 
-                                summary_md = (sum_resp.get("summary_markdown", "") or "").strip()
+                                sum_job_id = sum_start.get("job_id")
+                                if not sum_job_id:
+                                    st.error(f"Falha ao iniciar sumarização: {sum_start}")
+                                    st.stop()
+
+                                # 4) Polling do /status até vir RESULT
+                                st.info("Sumarização em andamento... isso pode levar alguns minutos na nuvem.")
+                                pbar2 = st.progress(0)
+                                status_area2 = st.empty()
+
+                                # Limites para não rodar infinito
+                                max_wait_seconds = 15 * 60  # 15 minutos
+                                started = time.time()
+
+                                final_result = None
+                                last_detail = ""
+
+                                while True:
+                                    if time.time() - started > max_wait_seconds:
+                                        st.error("Tempo máximo excedido aguardando a sumarização. Tente novamente.")
+                                        st.stop()
+
+                                    time.sleep(2.0)
+
+                                    try:
+                                        st_sum_status = api_status(sum_job_id)
+                                    except Exception as e:
+                                        status_area2.warning(f"Aguardando... (falha temporária no status: {e})")
+                                        continue
+
+                                    prog2 = int(st_sum_status.get("progress", 0))
+                                    detail2 = (st_sum_status.get("detail", "") or "").strip()
+                                    if detail2 and detail2 != last_detail:
+                                        last_detail = detail2
+
+                                    pbar2.progress(min(max(prog2, 0), 100))
+                                    status_area2.info(f"Status da IA: {prog2}% - {detail2}")
+
+                                    if st_sum_status.get("status") == "done":
+                                        final_result = st_sum_status.get("result") or {}
+                                        break
+
+                                    if st_sum_status.get("status") == "error":
+                                        st.error(f"Sumarização falhou: {st_sum_status.get('detail')}")
+                                        st.stop()
+
+                                summary_md = ((final_result or {}).get("summary_markdown") or "").strip()
                                 if summary_md:
                                     st.markdown("**Prévia do relatório:**")
                                     st.markdown(summary_md)
@@ -490,7 +555,7 @@ elif pagina == "Área Jusreport":
                                     st.error("A IA não retornou conteúdo para o relatório.")
                                     st.stop()
 
-                                # 4) Export DOCX
+                                # 5) Export DOCX
                                 nome_saida = f"Sum_{row['numero_processo']}.docx"
                                 with st.spinner("Exportando relatório para DOCX..."):
                                     docx_bytes = api_export_docx(
@@ -520,6 +585,7 @@ elif pagina == "Área Jusreport":
                                     st.success("Relatório gerado, finalizado e enviado ao cliente!")
                                 else:
                                     st.success("Relatório gerado e salvo para conferência do advogado.")
+
                                 st.rerun()
 
                         except requests.HTTPError as e:
@@ -546,34 +612,47 @@ elif pagina == "Área Jusreport":
         except Exception:
             pass
 
-        st.dataframe(df_finalizados.drop(columns=["caminho_arquivo"], errors="ignore"))
+        df_view = df_finalizados.drop(columns=["caminho_arquivo"], errors="ignore")
+        st.dataframe(df_view)
 
-        output_finalizados = BytesIO()
-        with pd.ExcelWriter(output_finalizados, engine="openpyxl") as writer:
-            df_finalizados.drop(columns=["caminho_arquivo"], errors="ignore").to_excel(
-                writer, index=False, sheet_name="RelatoriosFinalizados"
+        excel_bytes = _df_to_excel_bytes_or_none(df_view, sheet_name="RelatoriosFinalizados")
+        if excel_bytes is not None:
+            st.download_button(
+                label="Baixar Relatórios Finalizados (Excel)",
+                data=excel_bytes,
+                file_name="relatorios_finalizados.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-
-        st.download_button(
-            label="Baixar Relatórios Finalizados (Excel)",
-            data=output_finalizados.getvalue(),
-            file_name="relatorios_finalizados.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        else:
+            st.warning("⚠️ Exportação Excel indisponível (openpyxl não instalado). Baixe em CSV.")
+            st.download_button(
+                label="Baixar Relatórios Finalizados (CSV)",
+                data=df_view.to_csv(index=False).encode("utf-8"),
+                file_name="relatorios_finalizados.csv",
+                mime="text/csv",
+            )
 
     # -------- Relatório Mensal --------
     st.subheader("Relatório Mensal de Processos por Cliente")
     df_contagem = carregar_contagem_processos_mensal_df()
     if not df_contagem.empty:
         st.dataframe(df_contagem)
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df_contagem.to_excel(writer, index=False, sheet_name="RelatorioMensal")
-        st.download_button(
-            label="Baixar Relatório em Excel",
-            data=output.getvalue(),
-            file_name="relatorio_mensal_processos.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+
+        excel_bytes2 = _df_to_excel_bytes_or_none(df_contagem, sheet_name="RelatorioMensal")
+        if excel_bytes2 is not None:
+            st.download_button(
+                label="Baixar Relatório em Excel",
+                data=excel_bytes2,
+                file_name="relatorio_mensal_processos.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.warning("⚠️ Exportação Excel indisponível (openpyxl não instalado). Baixe em CSV.")
+            st.download_button(
+                label="Baixar Relatório em CSV",
+                data=df_contagem.to_csv(index=False).encode("utf-8"),
+                file_name="relatorio_mensal_processos.csv",
+                mime="text/csv",
+            )
     else:
         st.info("Nenhum processo enviado ainda para gerar o relatório.")

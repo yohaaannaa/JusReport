@@ -4,7 +4,7 @@ import io
 import traceback
 from typing import Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
@@ -77,7 +77,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# "Banco" simplificado em memória para monitorar ingest
+# "Banco" simplificado em memória para monitorar ingest e summarize assíncrono
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -117,6 +117,12 @@ def health():
     }
 
 
+@app.head("/health")
+def health_head():
+    # evita 405 em HEAD /health (alguns checks usam HEAD)
+    return {}
+
+
 @app.post("/ingest")
 async def ingest(
     files: list[UploadFile] = File(...),
@@ -125,8 +131,7 @@ async def ingest(
 ):
     """
     Recebe 1 arquivo (usaremos só o primeiro por enquanto),
-    salva em data/uploads e cria um job já marcado como "done"
-    (ingestão simplificada).
+    salva em data/uploads e cria um job marcado como "done" (ingestão simples).
     """
     if not files:
         raise HTTPException(status_code=400, detail="Nenhum arquivo enviado")
@@ -141,14 +146,14 @@ async def ingest(
         out.write(content)
 
     JOBS[job_id] = {
-        "status": "done",            # simplificado: ingestão finalizada
+        "status": "done",            # ingestão concluída
         "progress": 100,
         "detail": "Ingestão concluída (simples)",
         "file_path": save_path,
         "case_number": case_number,
         "client_id": client_id,
-        # meta poderá guardar, por exemplo, páginas de planilhas/SISBAJUD
         "meta": {},
+        "result": None,              # aqui entra o resultado do summarize assíncrono
     }
 
     return {"job_id": job_id}
@@ -157,39 +162,25 @@ async def ingest(
 @app.get("/status/{job_id}")
 def status(job_id: str):
     """
-    Usado pela interface para exibir barra de progresso.
-    Aqui o job já fica como 100% concluído.
+    Usado pela interface para exibir barra de progresso e recuperar o resultado.
     """
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
+
     return {
-        "status": job["status"],
-        "progress": job["progress"],
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
         "detail": job.get("detail", ""),
-        "result": None,
+        "result": job.get("result"),   # <- quando done, vem aqui
     }
 
 
 # ============================================================
 # EXTRAÇÃO DE TEXTO DO PDF (HOTSPOTS + AMOSTRAGEM GLOBAL)
-# COM TENTATIVA DE EXTRAÇÃO DE PLANILHAS (TABELAS)
-# E RETORNO DE METADADOS (PÁGINAS RELEVANTES)
 # ============================================================
 
 def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
-    """
-    Extrai texto do PDF combinando:
-      1) PÁGINAS RELEVANTES ("hotspots") que contenham palavras-chave
-         ligadas a planilhas, demonstrativos, SISBAJUD/BACENJUD, bloqueios etc.
-         Nessas páginas, além do texto, tenta extrair tabelas e inclui o conteúdo.
-      2) AMOSTRAGEM GLOBAL em 4 blocos (início, meio, pré-final e final).
-
-    Retorna:
-      - final_text: string com o texto que será enviado ao modelo.
-      - meta: dict com metadados, ex. {"planilha_pages": [573, 587, ...]}
-    """
-
     text_by_page: list[str] = []
     pages_obj = []
 
@@ -202,20 +193,16 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
     except Exception as e:
         print(f"[ERRO] Falha ao ler PDF {path}: {e}")
 
-    # Texto completo (para amostragem global)
     full_text = "\n\n".join(text_by_page) if text_by_page else ""
     total_len = len(full_text)
 
     if total_len == 0:
         return "", {"planilha_pages": []}
 
-    # Valor vindo do .env
     env_max = int(os.getenv("MAX_PDF_CHARS", "30000"))
 
-    # TETO DURO para não matar o modelo / gerar timeout absurdo
-    HARD_CAP_CHARS = 80000  # pode ajustar (60000–80000) conforme performance
-
-    # Limite efetivo a ser usado
+    # Render Free + Gemini: manter isso mais conservador ajuda MUITO a evitar 502
+    HARD_CAP_CHARS = 40000  # <- mais seguro na nuvem (ajuste se quiser)
     max_chars = min(env_max, HARD_CAP_CHARS)
 
     print(
@@ -223,20 +210,14 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
         f"| usando max_chars={max_chars} | total_len={total_len}"
     )
 
-    # Se todo o texto couber, não fazemos cortes
     if total_len <= max_chars:
         print(
             f"[INFO] Texto do PDF com {total_len} caracteres, "
             f"abaixo ou igual ao limite efetivo {max_chars}. Usando texto completo."
         )
-        # Mesmo assim, vamos tentar marcar páginas relevantes
         planilha_pages = _detect_planilha_pages(text_by_page)
         return full_text, {"planilha_pages": planilha_pages}
 
-    # --------------------------------------------------------
-    # 1) HOTSPOTS: páginas com "planilha", "sisbajud", etc.
-    #    Nessas páginas, além do texto, tentamos extrair tabelas.
-    # --------------------------------------------------------
     keywords = [
         "planilha",
         "demonstrativo",
@@ -256,15 +237,13 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
         raw_page_text = page_text or ""
         tl = raw_page_text.lower()
 
-        # Verifica se esta página contém alguma palavra-chave
         if any(k in tl for k in keywords):
-            page_num = idx + 1  # 1-based, como no processo
+            page_num = idx + 1
             planilha_pages.append(page_num)
 
             bloco = [f"\n\n=== PÁGINA RELEVANTE {page_num} (palavras-chave localizadas) ===\n\n"]
             bloco.append(raw_page_text)
 
-            # Tenta extrair tabelas dessa página
             try:
                 page = pages_obj[idx]
                 tables = page.extract_tables() or []
@@ -286,14 +265,12 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
 
     hotspot_text = "".join(hotspot_parts).strip()
 
-    # Se não houver hotspots, só usamos a amostragem global
     if not hotspot_text:
         print("[INFO] Nenhuma página com palavras-chave relevantes encontrada. Usando apenas amostragem global.")
         global_sample = _build_global_sample(full_text, max_chars)
         return global_sample, {"planilha_pages": []}
 
-    # Se houver hotspots, limitamos para não estourar o espaço inteiro
-    max_hotspot = int(max_chars * 0.6)  # no máx. 60% do orçamento para hotspots
+    max_hotspot = int(max_chars * 0.6)
     if len(hotspot_text) > max_hotspot:
         print(
             f"[AVISO] Texto de hotspots com {len(hotspot_text)} caracteres, "
@@ -310,10 +287,6 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
         )
         return hotspot_text, {"planilha_pages": planilha_pages}
 
-    # --------------------------------------------------------
-    # 2) AMOSTRAGEM GLOBAL (início + meio + pré-final + final)
-    #    usando apenas o espaço restante.
-    # --------------------------------------------------------
     global_sample = _build_global_sample(full_text, remaining_chars)
 
     final_text = (
@@ -331,10 +304,6 @@ def _extract_text_from_pdf(path: str) -> tuple[str, Dict[str, Any]]:
 
 
 def _detect_planilha_pages(text_by_page: list[str]) -> list[int]:
-    """
-    Detecta páginas que tenham palavras-chave de planilha/SISBAJUD
-    quando estamos no cenário em que o texto inteiro coube no limite.
-    """
     keywords = [
         "planilha",
         "demonstrativo",
@@ -356,29 +325,21 @@ def _detect_planilha_pages(text_by_page: list[str]) -> list[int]:
 
 
 def _build_global_sample(full_text: str, max_chars: int) -> str:
-    """
-    Monta uma amostragem global em 4 blocos (início, meio, pré-final, final)
-    respeitando max_chars.
-    """
     total_len = len(full_text)
     if total_len <= max_chars:
         return full_text
 
-    # Divide o limite em 4 partes
     part = max_chars // 4
     if part == 0:
         part = max_chars
 
-    # 1) INÍCIO
     inicio = full_text[:part]
 
-    # 2) MEIO (centralizado)
     mid_center = total_len // 2
     mid_start = max(0, mid_center - part // 2)
     mid_end = min(total_len, mid_start + part)
     meio = full_text[mid_start:mid_end]
 
-    # 3) PRÉ-FINAL (região antes do final, ~2 partes a partir do fim)
     pre_final_start = max(0, total_len - (part * 2))
     pre_final_end = pre_final_start + part
     if pre_final_end > total_len:
@@ -386,7 +347,6 @@ def _build_global_sample(full_text: str, max_chars: int) -> str:
         pre_final_start = max(0, pre_final_end - part)
     pre_final = full_text[pre_final_start:pre_final_end]
 
-    # 4) FINAL
     fim = full_text[-part:]
 
     return (
@@ -402,27 +362,14 @@ def _build_global_sample(full_text: str, max_chars: int) -> str:
 
 # ============================================================
 # "AGENTES" DE EXECUÇÃO: VÁRIAS PERGUNTAS → UM RELATÓRIO
-# (PROMPTS MAIS DETALHADOS/EXAUSTIVOS)
 # ============================================================
 
 def _run_execucao_agents(base_text: str, case_number: str, action_type: str) -> tuple[str, dict]:
-    """
-    Envia VÁRIAS PERGUNTAS separadas para o Gemini (uma por seção)
-    e monta um relatório final em Markdown.
-
-    Retorna:
-      - final_md: relatório completo
-      - sections: dict com o texto bruto de cada seção
-    """
-
     if not text_model:
         raise RuntimeError("Modelo Gemini não está configurado (text_model=None).")
 
     tasks = [
-        {
-            "key": "cabecalho",
-            "title": "Cabeçalho",
-            "instruction": f"""
+        {"key": "cabecalho", "title": "Cabeçalho", "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO DE TÍTULO EXTRAJUDICIAL.
 
 Sua tarefa NÃO é resumir, mas sim **organizar todas as informações relevantes** que encontrar.
@@ -458,12 +405,9 @@ Outras regras:
 - Se algum item não aparecer, escreva "Não informado".
 - Sempre que houver número de documento ou folha/página (ex.: fls. 573), mencione entre parênteses.
 - Responda em Markdown começando com o título "## Cabeçalho" e bullets iniciando com "• ".
-"""
-        },
-        {
-            "key": "resumo_inicial",
-            "title": "Resumo da Petição Inicial",
-            "instruction": f"""
+"""},
+
+        {"key": "resumo_inicial", "title": "Resumo da Petição Inicial", "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO DE TÍTULO EXTRAJUDICIAL.
 
 Sua tarefa aqui é fazer um **resumo rico em detalhes**, não superficial.
@@ -495,12 +439,9 @@ Regras:
 - Use entre 3 e 8 parágrafos, além de bullets para os pedidos.
 - Não invente fatos; se algo não constar, simplesmente não mencione ou indique "Não informado".
 - Comece com o título "## Resumo da Petição Inicial" em Markdown.
-"""
-        },
-        {
-            "key": "penhora",
-            "title": "Tentativas de Penhora Online e Garantias",
-            "instruction": f"""
+"""},
+
+        {"key": "penhora", "title": "Tentativas de Penhora Online e Garantias", "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO.
 
 Aqui você deve focar especificamente nas **buscas de bens e garantias**.
@@ -537,12 +478,9 @@ Com base EXCLUSIVAMENTE no texto abaixo, faça uma seção chamada
 Regras:
 - Liste cada medida em bullets, com datas e valores sempre que aparecerem.
 - Não invente informação nem conclua negativamente sobre o processo todo; limite-se aos trechos analisados.
-"""
-        },
-        {
-            "key": "valores_planilhas",
-            "title": "Valores e Planilhas de Débito",
-            "instruction": f"""
+"""},
+
+        {"key": "valores_planilhas", "title": "Valores e Planilhas de Débito", "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO.
 
 Sua tarefa aqui é **minerar todos os valores e planilhas** que apareçam no texto.
@@ -586,12 +524,9 @@ Regras importantes:
 - NÃO invente valores ou datas.
 - Se não encontrar alguma parte (ex.: planilhas posteriores), escreva explicitamente:
   "Não foram localizadas planilhas posteriores nos trechos analisados."
-"""
-        },
-        {
-            "key": "movimentacoes",
-            "title": "Movimentações Processuais Relevantes",
-            "instruction": f"""
+"""},
+
+        {"key": "movimentacoes", "title": "Movimentações Processuais Relevantes", "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO.
 
 Agora você vai montar uma **linha do tempo detalhada**.
@@ -618,12 +553,9 @@ Regras:
   valor do crédito, garantias, prosseguimento/suspensão/extinção da execução.
 - Se a data exata não constar, use algo como "2008 (data não informada): ...".
 - Não faça comentários jurídicos aqui; apenas descreva os atos.
-"""
-        },
-        {
-            "key": "analise_juridica",
-            "title": "Análise Jurídica",
-            "instruction": f"""
+"""},
+
+        {"key": "analise_juridica", "title": "Análise Jurídica", "instruction": f"""
 Você é um assistente jurídico especialista em EXECUÇÃO.
 
 Agora você deve organizar uma **visão consolidada**, em bullets, baseada APENAS no que consta no texto.
@@ -660,8 +592,7 @@ Regras:
 - Seja o mais factual e detalhado possível, sem emitir opiniões jurídicas, recomendações ou juízos de valor.
 - Se não encontrar nada sobre um item, escreva exatamente "Não informado".
 - Não resuma demais: se houver muita informação relevante, distribua em frases curtas dentro do mesmo bullet.
-"""
-        },
+"""},
     ]
 
     sections: dict[str, str] = {}
@@ -671,13 +602,13 @@ Regras:
 
 === TEXTO DO PROCESSO (EXTRAÍDO DO PDF) ===
 
-\"\"\"{base_text}\"\"\""""
+\"\"\"{base_text}\"\"\"
+"""
         print(f"[AGENTE] Rodando sub-tarefa: {task['key']} ({task['title']})")
         resp = text_model.generate_content(prompt)
         text = (resp.text or "").strip()
         sections[task["key"]] = text
 
-    # Monta o relatório final
     md_parts: list[str] = []
     md_parts.append(f"Sumarização da {action_type} ({case_number})\n")
 
@@ -703,87 +634,108 @@ Regras:
 
 
 # ============================================================
-# ENDPOINT /summarize - MANDANDO UMA PERGUNTA POR VEZ (AGENTES)
+# WORKER ASSÍNCRONO DO /summarize (evita 502 no Render)
 # ============================================================
 
-@app.post("/summarize")
-async def summarize(req: SummarizeRequest):
-    """
-    Versão multi-agentes para EXECUÇÃO:
-
-    1) Localiza o PDF correspondente ao número do processo.
-    2) Extrai o texto (limitado) com hotspots (planilhas/SISBAJUD) + amostragem,
-       e guarda as páginas de planilha/SISBAJUD em JOBS[job]["meta"].
-    3) Envia VÁRIAS PERGUNTAS separadas para o Gemini (cabeçalho, resumo,
-       penhora, valores/planilhas, movimentações, análise jurídica).
-    4) Junta tudo em um relatório final em Markdown e devolve para o Streamlit.
-    """
+def _summarize_worker(job_id: str, case_number: str, action_type: str) -> None:
     try:
-        case_number = req.case_number
-        action_type = req.action_type
-
-        # 1) Encontrar o job correspondente ao número do processo
-        job = None
-        for j in JOBS.values():
-            if j.get("case_number") == case_number:
-                job = j
-                break
-
+        job = JOBS.get(job_id)
         if not job:
-            raise HTTPException(
-                status_code=404,
-                detail="Nenhum job encontrado para esse número de processo"
-            )
+            return
+
+        if not GEMINI_API_KEY or not text_model:
+            job["status"] = "error"
+            job["progress"] = 100
+            job["detail"] = "Gemini não configurado na API (Environment)."
+            return
+
+        job["status"] = "running"
+        job["progress"] = 10
+        job["detail"] = "Extraindo texto do PDF..."
 
         file_path = job["file_path"]
 
-        if not GEMINI_API_KEY or not text_model:
-            raise HTTPException(
-                status_code=500,
-                detail="Gemini não configurado na API (.env)"
-            )
-
-        # 2) Extrair texto do PDF (hotspots + amostragem global, com limite)
         base_text, meta = _extract_text_from_pdf(file_path)
         if not base_text:
             base_text = "Não foi possível extrair texto do PDF. Verifique o arquivo."
 
-        # Guarda metadados (ex.: páginas com planilhas/SISBAJUD) no job
-        if meta:
-            job_meta = job.get("meta") or {}
-            job_meta.update(meta)
-            job["meta"] = job_meta
+        # guarda meta no job
+        job_meta = job.get("meta") or {}
+        job_meta.update(meta or {})
+        job["meta"] = job_meta
 
-        # 3) Rodar "multiagentes" de execução (várias perguntas → um relatório)
+        job["progress"] = 35
+        job["detail"] = "Gerando relatório com IA (Gemini)..."
+
         final_md, sections = _run_execucao_agents(
             base_text=base_text,
             case_number=case_number,
             action_type=action_type,
         )
 
-        return {
+        job["progress"] = 95
+        job["detail"] = "Finalizando..."
+
+        job["result"] = {
             "summary_markdown": final_md,
-            "sections": sections,  # cada resposta separada (opcional usar no futuro)
-            "used_chunks": [],     # futuro: integrar com RAG
-            "result": {
-                "meta": meta
-            },          # futuro: JSON estruturado mais rico
+            "sections": sections,
+            "used_chunks": [],
+            "meta": meta,
         }
 
-    except HTTPException:
-        raise
+        job["status"] = "done"
+        job["progress"] = 100
+        job["detail"] = "Sumarização concluída."
+
     except Exception as e:
         tb = traceback.format_exc()
-        print("ERRO EM /summarize:\n", tb)
-        raise HTTPException(
-            status_code=500,
-            detail=f"{e.__class__.__name__}: {e}"
-        )
+        print("ERRO NO WORKER /summarize:\n", tb)
+        job = JOBS.get(job_id)
+        if job:
+            job["status"] = "error"
+            job["progress"] = 100
+            job["detail"] = f"{e.__class__.__name__}: {e}"
+
+
+# ============================================================
+# ENDPOINT /summarize - AGORA ASSÍNCRONO (retorna job_id)
+# ============================================================
+
+@app.post("/summarize")
+async def summarize(req: SummarizeRequest, background_tasks: BackgroundTasks):
+    """
+    Agora o /summarize NÃO segura a conexão.
+    Ele inicia um job e devolve rápido {"job_id": "..."}.
+    O resultado final fica disponível em /status/{job_id} -> result.
+    """
+    case_number = req.case_number
+    action_type = req.action_type
+
+    # Encontrar o job correspondente ao número do processo
+    found_job_id = None
+    for jid, j in JOBS.items():
+        if j.get("case_number") == case_number:
+            found_job_id = jid
+            break
+
+    if not found_job_id:
+        raise HTTPException(status_code=404, detail="Nenhum job encontrado para esse número de processo")
+
+    job = JOBS[found_job_id]
+
+    # marca como queued e dispara o worker
+    job["status"] = "queued"
+    job["progress"] = 5
+    job["detail"] = "Fila de sumarização iniciada..."
+    job["result"] = None
+
+    background_tasks.add_task(_summarize_worker, found_job_id, case_number, action_type)
+
+    return {"job_id": found_job_id, "status": "queued"}
 
 
 # ============================================================
 # ENDPOINT /export/docx - GERA DOCX A PARTIR DO MARKDOWN
-# COM OPÇÃO DE INSERIR PRINTS DAS PÁGINAS DE PLANILHA/SISBAJUD
 # ============================================================
 
 @app.post("/export/docx")
@@ -793,22 +745,11 @@ async def export_docx(
     case_number: str | None = Form(None),
     include_planilha_images: bool = Form(False),
 ):
-    """
-    Recebe um texto em Markdown simples e devolve um DOCX.
-    - Converte # e ## em títulos.
-    - Se include_planilha_images=True e case_number fornecido, tenta:
-        * localizar o job correspondente
-        * ler meta["planilha_pages"]
-        * gerar imagens dessas páginas (se pdf2image estiver disponível)
-        * inserir no final do DOCX em "Anexos – Planilhas e Bloqueios Relevantes"
-          com legenda "Planilha / demonstrativo – pág. X".
-    """
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
 
-    # Conteúdo principal (texto)
     for line in content.splitlines():
         if line.startswith("# "):
             doc.add_heading(line[2:], level=1)
@@ -817,12 +758,10 @@ async def export_docx(
         else:
             doc.add_paragraph(line)
 
-    # Se for para incluir prints de planilhas/SISBAJUD
     if include_planilha_images and case_number:
         if not PDF2IMAGE_AVAILABLE:
             print("[AVISO] include_planilha_images=True, mas pdf2image não está disponível. Nenhuma imagem será inserida.")
         else:
-            # Encontrar job pelo número do processo
             job = None
             for j in JOBS.values():
                 if j.get("case_number") == case_number:
@@ -838,11 +777,9 @@ async def export_docx(
                     file_path = job.get("file_path")
                     if file_path and os.path.exists(file_path):
                         try:
-                            # Converte o PDF inteiro em imagens (lista de páginas)
                             print(f"[INFO] Gerando imagens das páginas {planilha_pages} do PDF para anexar no DOCX...")
                             images = convert_from_path(file_path)
 
-                            # Insere seção de anexos no final
                             doc.add_page_break()
                             doc.add_heading("Anexos – Planilhas e Bloqueios Relevantes", level=1)
 
@@ -853,11 +790,9 @@ async def export_docx(
                                     img.save(img_bytes, format="PNG")
                                     img_bytes.seek(0)
 
-                                    # Legenda / título antes da imagem
                                     doc.add_paragraph(f"Planilha / demonstrativo – pág. {p}")
-                                    # Insere imagem – largura fixa para caber na página
                                     doc.add_picture(img_bytes, width=Inches(6.0))
-                                    doc.add_paragraph("")  # espaço depois da imagem
+                                    doc.add_paragraph("")
                         except Exception as e:
                             print(f"[AVISO] Falha ao gerar/ inserir imagens de planilha no DOCX: {e}")
                     else:
